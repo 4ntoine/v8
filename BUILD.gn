@@ -170,7 +170,7 @@ config("internal_config") {
 
   include_dirs = [ "." ]
 
-  if (is_component_build) {
+  if (is_component_build || v8_component_build) {
     defines = [ "BUILDING_V8_SHARED" ]
   }
 }
@@ -191,7 +191,7 @@ config("libplatform_config") {
 
 # This config should be applied to code using the libbase.
 config("libbase_config") {
-  if (is_component_build) {
+  if (is_component_build || v8_component_build) {
     defines = [ "USING_V8_BASE_SHARED" ]
   }
   libs = []
@@ -209,7 +209,7 @@ config("libsampler_config") {
 # itself.
 config("external_config") {
   defines = []
-  if (is_component_build) {
+  if (is_component_build || v8_component_build) {
     defines += [ "USING_V8_SHARED" ]
   }
   if (v8_enable_v8_checks) {
@@ -783,9 +783,8 @@ action("run_mksnapshot") {
   ]
 
   args = [
-    "./" + rebase_path(get_label_info(":mksnapshot($v8_snapshot_toolchain)",
-                                      "root_out_dir") + "/mksnapshot",
-                       root_build_dir),
+    rebase_path(get_label_info(":mksnapshot($v8_snapshot_toolchain)",
+                               "root_out_dir") + "/mksnapshot"),
     "--startup_src",
     rebase_path("$target_gen_dir/snapshot.cc", root_build_dir),
   ]
@@ -851,6 +850,7 @@ action("v8_dump_build_config") {
     "v8_enable_verify_predictable=$v8_enable_verify_predictable",
     "v8_target_cpu=\"$v8_target_cpu\"",
     "v8_use_snapshot=$v8_use_snapshot",
+    "v8_component_build=$v8_component_build"
   ]
 }
 
@@ -2463,6 +2463,7 @@ v8_source_set("v8_base") {
 }
 
 v8_component("v8_libbase") {
+  force_shared_library = true
   sources = [
     "src/base/adapters.h",
     "src/base/atomic-utils.h",
@@ -2531,7 +2532,7 @@ v8_component("v8_libbase") {
 
   defines = []
 
-  if (is_component_build) {
+  if (is_component_build || v8_component_build) {
     defines = [ "BUILDING_V8_BASE_SHARED" ]
   }
 
@@ -2701,6 +2702,12 @@ if (current_toolchain == v8_snapshot_toolchain) {
 
     configs = [ ":internal_config" ]
 
+    if (v8_component_build) {
+      configs += [
+        "//build/config/gcc:rpath_for_built_shared_libraries"
+        ]
+    }
+
     deps = [
       ":v8_base",
       ":v8_init",
@@ -2787,8 +2794,11 @@ group("v8_fuzzers") {
   ]
 }
 
-if (is_component_build) {
+# we need to have v8 shared libs as we have to link libadblockplus-jni.so with it.
+# see https://issues.adblockplus.org/ticket/6369
+if (true) {
   v8_component("v8") {
+    force_shared_library = true
     sources = [
       "src/v8dll-main.cc",
     ]
