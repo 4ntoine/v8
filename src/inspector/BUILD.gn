@@ -90,7 +90,7 @@ config("inspector_config") {
       "/wd4996",  # Deprecated function call.
     ]
   }
-  if (is_component_build) {
+  if (is_component_build || v8_component_build) {
     defines = [ "BUILDING_V8_SHARED" ]
   }
 }

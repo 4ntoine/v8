@@ -45,6 +45,9 @@ declare_args() {
 
   # Use static libraries instead of source_sets.
   v8_static_library = false
+
+  # we need to have libv8.cr.so and some other shared libraries to link libadblockplus-android.so
+  v8_component_build = false
 }
 
 if (v8_use_external_startup_data == "") {
@@ -167,10 +170,32 @@ template("v8_executable") {
 }
 
 template("v8_component") {
-  component(target_name) {
-    forward_variables_from(invoker, "*", [ "configs" ])
-    configs += invoker.configs
-    configs -= v8_remove_configs
-    configs += v8_add_configs
+
+  if (defined(invoker.force_shared_library) && invoker.force_shared_library) {
+    shared_library(target_name) {
+      output_extension = "cr.so" # in order to load this app V8 shared library, not system one
+      forward_variables_from(invoker, "*", [ "configs" ])
+      configs += invoker.configs
+      configs -= v8_remove_configs
+      configs += v8_add_configs
+
+      if (is_android) {
+        configs -= [ "//build/config/android:hide_all_but_jni_onload" ]
+      }
+
+      if (!defined(deps)) {
+        deps = []
+      }
+
+      deps += [ "//build/config:exe_and_shlib_deps" ]
+    }
+  } else {
+    component(target_name) {
+      forward_variables_from(invoker, "*", [ "configs" ])
+      configs += invoker.configs
+      configs -= v8_remove_configs
+      configs += v8_add_configs
+    }
   }
+
 }
