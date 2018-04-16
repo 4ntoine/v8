@@ -806,6 +806,7 @@ if (v8_use_snapshot) {
     args = [
       rebase_path(get_label_info(":mksnapshot($v8_snapshot_toolchain)",
                                  "root_out_dir") + "/mksnapshot"),
+      "--turbo_instruction_scheduling",
       "--startup_src",
       rebase_path("$target_gen_dir/snapshot.cc", root_build_dir),
     ]
@@ -814,15 +815,6 @@ if (v8_use_snapshot) {
 
     outputs = [
       "$target_gen_dir/snapshot.cc",
-    ]
-
-    args = [
-      "./" + rebase_path(get_label_info(":mksnapshot($v8_snapshot_toolchain)",
-                                        "root_out_dir") + "/mksnapshot",
-                         root_build_dir),
-      "--turbo_instruction_scheduling",
-      "--startup_src",
-      rebase_path("$target_gen_dir/snapshot.cc", root_build_dir),
     ]
 
     if (v8_random_seed != "0") {
