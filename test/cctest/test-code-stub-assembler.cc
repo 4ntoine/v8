@@ -237,8 +237,8 @@ TEST(DecodeWordFromWord32) {
   CodeStubAssembler m(asm_tester.state());
 
   class TestBitField : public BitField<unsigned, 3, 3> {};
-  m.Return(
-      m.SmiTag(m.DecodeWordFromWord32<TestBitField>(m.Int32Constant(0x2f))));
+  m.Return(m.SmiTag(
+      m.Signed(m.DecodeWordFromWord32<TestBitField>(m.Int32Constant(0x2F)))));
   FunctionTester ft(asm_tester.GenerateCode());
   MaybeHandle<Object> result = ft.Call();
   // value  = 00101111
@@ -657,10 +657,7 @@ TEST(NameDictionaryLookup) { TestNameDictionaryLookup<NameDictionary>(); }
 
 TEST(GlobalDictionaryLookup) { TestNameDictionaryLookup<GlobalDictionary>(); }
 
-namespace {
-
-template <typename Dictionary>
-void TestNumberDictionaryLookup() {
+TEST(NumberDictionaryLookup) {
   Isolate* isolate(CcTest::InitIsolateOnce());
 
   const int kNumParams = 4;
@@ -678,8 +675,8 @@ void TestNumberDictionaryLookup() {
     Label if_found(&m), if_not_found(&m);
     Variable var_entry(&m, MachineType::PointerRepresentation());
 
-    m.NumberDictionaryLookup<Dictionary>(dictionary, key, &if_found, &var_entry,
-                                         &if_not_found);
+    m.NumberDictionaryLookup(dictionary, key, &if_found, &var_entry,
+                             &if_not_found);
     m.BIND(&if_found);
     m.GotoIfNot(
         m.WordEqual(expected_result, m.SmiConstant(Smi::FromInt(kFound))),
@@ -705,7 +702,8 @@ void TestNumberDictionaryLookup() {
   Handle<Object> expect_not_found(Smi::FromInt(kNotFound), isolate);
 
   const int kKeysCount = 1000;
-  Handle<Dictionary> dictionary = Dictionary::New(isolate, kKeysCount);
+  Handle<NumberDictionary> dictionary =
+      NumberDictionary::New(isolate, kKeysCount);
   uint32_t keys[kKeysCount];
 
   Handle<Object> fake_value(Smi::FromInt(42), isolate);
@@ -716,15 +714,16 @@ void TestNumberDictionaryLookup() {
   for (int i = 0; i < kKeysCount; i++) {
     int random_key = rand_gen.NextInt(Smi::kMaxValue);
     keys[i] = static_cast<uint32_t>(random_key);
-    if (dictionary->FindEntry(keys[i]) != Dictionary::kNotFound) continue;
+    if (dictionary->FindEntry(keys[i]) != NumberDictionary::kNotFound) continue;
 
-    dictionary = Dictionary::Add(dictionary, keys[i], fake_value, fake_details);
+    dictionary =
+        NumberDictionary::Add(dictionary, keys[i], fake_value, fake_details);
   }
 
   // Now try querying existing keys.
   for (int i = 0; i < kKeysCount; i++) {
     int entry = dictionary->FindEntry(keys[i]);
-    CHECK_NE(Dictionary::kNotFound, entry);
+    CHECK_NE(NumberDictionary::kNotFound, entry);
 
     Handle<Object> key(Smi::FromInt(keys[i]), isolate);
     Handle<Object> expected_entry(Smi::FromInt(entry), isolate);
@@ -735,22 +734,12 @@ void TestNumberDictionaryLookup() {
   for (int i = 0; i < kKeysCount;) {
     int random_key = rand_gen.NextInt(Smi::kMaxValue);
     int entry = dictionary->FindEntry(random_key);
-    if (entry != Dictionary::kNotFound) continue;
+    if (entry != NumberDictionary::kNotFound) continue;
     i++;
 
     Handle<Object> key(Smi::FromInt(random_key), isolate);
     ft.CheckTrue(dictionary, key, expect_not_found);
   }
-}
-
-}  // namespace
-
-TEST(SeededNumberDictionaryLookup) {
-  TestNumberDictionaryLookup<SeededNumberDictionary>();
-}
-
-TEST(UnseededNumberDictionaryLookup) {
-  TestNumberDictionaryLookup<UnseededNumberDictionary>();
 }
 
 namespace {
@@ -902,7 +891,8 @@ TEST(TryHasOwnProperty) {
 
   {
     // Dictionary mode object.
-    Handle<JSFunction> function = factory->NewFunction(factory->empty_string());
+    Handle<JSFunction> function =
+        factory->NewFunctionForTest(factory->empty_string());
     Handle<JSObject> object = factory->NewJSObject(function);
     AddProperties(object, names, arraysize(names));
     JSObject::NormalizeProperties(object, CLEAR_INOBJECT_PROPERTIES, 0, "test");
@@ -919,11 +909,12 @@ TEST(TryHasOwnProperty) {
 
   {
     // Global object.
-    Handle<JSFunction> function = factory->NewFunction(factory->empty_string());
+    Handle<JSFunction> function =
+        factory->NewFunctionForTest(factory->empty_string());
     JSFunction::EnsureHasInitialMap(function);
     function->initial_map()->set_instance_type(JS_GLOBAL_OBJECT_TYPE);
     function->initial_map()->set_is_prototype_map(true);
-    function->initial_map()->set_dictionary_map(true);
+    function->initial_map()->set_is_dictionary_map(true);
     function->initial_map()->set_may_have_interesting_symbols(true);
     Handle<JSObject> object = factory->NewJSGlobalObject(function);
     AddProperties(object, names, arraysize(names));
@@ -969,7 +960,8 @@ TEST(TryHasOwnProperty) {
   }
 
   {
-    Handle<JSFunction> function = factory->NewFunction(factory->empty_string());
+    Handle<JSFunction> function =
+        factory->NewFunctionForTest(factory->empty_string());
     Handle<JSProxy> object = factory->NewJSProxy(function, objects[0]);
     CHECK_EQ(JS_PROXY_TYPE, object->map()->instance_type());
     ft.CheckTrue(object, names[0], expect_bailout);
@@ -1042,11 +1034,11 @@ TEST(TryGetOwnProperty) {
       factory->NewPrivateSymbol(),
   };
   Handle<Object> values[] = {
-      factory->NewFunction(factory->empty_string()),
+      factory->NewFunctionForTest(factory->empty_string()),
       factory->NewSymbol(),
       factory->InternalizeUtf8String("a"),
       CreateAccessorPair(&ft, "() => 188;", "() => 199;"),
-      factory->NewFunction(factory->InternalizeUtf8String("bb")),
+      factory->NewFunctionForTest(factory->InternalizeUtf8String("bb")),
       factory->InternalizeUtf8String("ccc"),
       CreateAccessorPair(&ft, "() => 88;", nullptr),
       handle(Smi::FromInt(1), isolate),
@@ -1054,7 +1046,8 @@ TEST(TryGetOwnProperty) {
       CreateAccessorPair(&ft, nullptr, "() => 99;"),
       factory->NewHeapNumber(4.2),
       handle(Smi::FromInt(153), isolate),
-      factory->NewJSObject(factory->NewFunction(factory->empty_string())),
+      factory->NewJSObject(
+          factory->NewFunctionForTest(factory->empty_string())),
       factory->NewPrivateSymbol(),
   };
   STATIC_ASSERT(arraysize(values) < arraysize(names));
@@ -1104,7 +1097,8 @@ TEST(TryGetOwnProperty) {
 
   {
     // Dictionary mode object.
-    Handle<JSFunction> function = factory->NewFunction(factory->empty_string());
+    Handle<JSFunction> function =
+        factory->NewFunctionForTest(factory->empty_string());
     Handle<JSObject> object = factory->NewJSObject(function);
     AddProperties(object, names, arraysize(names), values, arraysize(values),
                   rand_gen.NextInt());
@@ -1174,7 +1168,8 @@ TEST(TryGetOwnProperty) {
   }
 
   {
-    Handle<JSFunction> function = factory->NewFunction(factory->empty_string());
+    Handle<JSFunction> function =
+        factory->NewFunctionForTest(factory->empty_string());
     Handle<JSProxy> object = factory->NewJSProxy(function, objects[0]);
     CHECK_EQ(JS_PROXY_TYPE, object->map()->instance_type());
     Handle<Object> value = ft.Call(object, names[0]).ToHandleChecked();
@@ -1406,7 +1401,8 @@ TEST(TryLookupElement) {
 
   {
     Handle<JSArray> handler = factory->NewJSArray(0);
-    Handle<JSFunction> function = factory->NewFunction(factory->empty_string());
+    Handle<JSFunction> function =
+        factory->NewFunctionForTest(factory->empty_string());
     Handle<JSProxy> object = factory->NewJSProxy(function, handler);
     CHECK_EQ(JS_PROXY_TYPE, object->map()->instance_type());
     ft.CheckTrue(object, smi0, expect_bailout);
@@ -1577,11 +1573,9 @@ TEST(OneToTwoByteStringCopy) {
   CodeAssemblerTester asm_tester(isolate, kNumParams);
   CodeStubAssembler m(asm_tester.state());
 
-  m.CopyStringCharacters(
-      m.Parameter(0), m.Parameter(1), m.SmiConstant(Smi::FromInt(0)),
-      m.SmiConstant(Smi::FromInt(0)), m.SmiConstant(Smi::FromInt(5)),
-      String::ONE_BYTE_ENCODING, String::TWO_BYTE_ENCODING,
-      CodeStubAssembler::SMI_PARAMETERS);
+  m.CopyStringCharacters(m.Parameter(0), m.Parameter(1), m.IntPtrConstant(0),
+                         m.IntPtrConstant(0), m.IntPtrConstant(5),
+                         String::ONE_BYTE_ENCODING, String::TWO_BYTE_ENCODING);
   m.Return(m.SmiConstant(Smi::FromInt(0)));
 
   Handle<String> string1 = isolate->factory()->InternalizeUtf8String("abcde");
@@ -1610,11 +1604,9 @@ TEST(OneToOneByteStringCopy) {
   CodeAssemblerTester asm_tester(isolate, kNumParams);
   CodeStubAssembler m(asm_tester.state());
 
-  m.CopyStringCharacters(
-      m.Parameter(0), m.Parameter(1), m.SmiConstant(Smi::FromInt(0)),
-      m.SmiConstant(Smi::FromInt(0)), m.SmiConstant(Smi::FromInt(5)),
-      String::ONE_BYTE_ENCODING, String::ONE_BYTE_ENCODING,
-      CodeStubAssembler::SMI_PARAMETERS);
+  m.CopyStringCharacters(m.Parameter(0), m.Parameter(1), m.IntPtrConstant(0),
+                         m.IntPtrConstant(0), m.IntPtrConstant(5),
+                         String::ONE_BYTE_ENCODING, String::ONE_BYTE_ENCODING);
   m.Return(m.SmiConstant(Smi::FromInt(0)));
 
   Handle<String> string1 = isolate->factory()->InternalizeUtf8String("abcde");
@@ -1643,11 +1635,9 @@ TEST(OneToOneByteStringCopyNonZeroStart) {
   CodeAssemblerTester asm_tester(isolate, kNumParams);
   CodeStubAssembler m(asm_tester.state());
 
-  m.CopyStringCharacters(
-      m.Parameter(0), m.Parameter(1), m.SmiConstant(Smi::FromInt(0)),
-      m.SmiConstant(Smi::FromInt(3)), m.SmiConstant(Smi::FromInt(2)),
-      String::ONE_BYTE_ENCODING, String::ONE_BYTE_ENCODING,
-      CodeStubAssembler::SMI_PARAMETERS);
+  m.CopyStringCharacters(m.Parameter(0), m.Parameter(1), m.IntPtrConstant(0),
+                         m.IntPtrConstant(3), m.IntPtrConstant(2),
+                         String::ONE_BYTE_ENCODING, String::ONE_BYTE_ENCODING);
   m.Return(m.SmiConstant(Smi::FromInt(0)));
 
   Handle<String> string1 = isolate->factory()->InternalizeUtf8String("abcde");
@@ -1673,11 +1663,9 @@ TEST(TwoToTwoByteStringCopy) {
   CodeAssemblerTester asm_tester(isolate, kNumParams);
   CodeStubAssembler m(asm_tester.state());
 
-  m.CopyStringCharacters(
-      m.Parameter(0), m.Parameter(1), m.SmiConstant(Smi::FromInt(0)),
-      m.SmiConstant(Smi::FromInt(0)), m.SmiConstant(Smi::FromInt(5)),
-      String::TWO_BYTE_ENCODING, String::TWO_BYTE_ENCODING,
-      CodeStubAssembler::SMI_PARAMETERS);
+  m.CopyStringCharacters(m.Parameter(0), m.Parameter(1), m.IntPtrConstant(0),
+                         m.IntPtrConstant(0), m.IntPtrConstant(5),
+                         String::TWO_BYTE_ENCODING, String::TWO_BYTE_ENCODING);
   m.Return(m.SmiConstant(Smi::FromInt(0)));
 
   uc16 array1[] = {2000, 2001, 2002, 2003, 2004};
@@ -1718,7 +1706,94 @@ TEST(Arguments) {
   CSA_ASSERT(
       &m, m.WordEqual(arguments.AtIndex(2), m.SmiConstant(Smi::FromInt(14))));
 
-  m.Return(arguments.GetReceiver());
+  arguments.PopAndReturn(arguments.GetReceiver());
+
+  FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
+  Handle<Object> result = ft.Call(isolate->factory()->undefined_value(),
+                                  Handle<Smi>(Smi::FromInt(12), isolate),
+                                  Handle<Smi>(Smi::FromInt(13), isolate),
+                                  Handle<Smi>(Smi::FromInt(14), isolate))
+                              .ToHandleChecked();
+  CHECK_EQ(*isolate->factory()->undefined_value(), *result);
+}
+
+TEST(ArgumentsWithSmiConstantIndices) {
+  Isolate* isolate(CcTest::InitIsolateOnce());
+
+  const int kNumParams = 4;
+  CodeAssemblerTester asm_tester(isolate, kNumParams);
+  CodeStubAssembler m(asm_tester.state());
+
+  CodeStubArguments arguments(&m, m.SmiConstant(3), nullptr,
+                              CodeStubAssembler::SMI_PARAMETERS);
+
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(m.SmiConstant(0),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(12))));
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(m.SmiConstant(1),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(13))));
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(m.SmiConstant(2),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(14))));
+
+  arguments.PopAndReturn(arguments.GetReceiver());
+
+  FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
+  Handle<Object> result = ft.Call(isolate->factory()->undefined_value(),
+                                  Handle<Smi>(Smi::FromInt(12), isolate),
+                                  Handle<Smi>(Smi::FromInt(13), isolate),
+                                  Handle<Smi>(Smi::FromInt(14), isolate))
+                              .ToHandleChecked();
+  CHECK_EQ(*isolate->factory()->undefined_value(), *result);
+}
+
+TNode<Smi> NonConstantSmi(CodeStubAssembler* m, int value) {
+  // Generate a SMI with the given value and feed it through a Phi so it can't
+  // be inferred to be constant.
+  Variable var(m, MachineRepresentation::kTagged, m->SmiConstant(value));
+  Label dummy_done(m);
+  // Even though the Goto always executes, it will taint the variable and thus
+  // make it appear non-constant when used later.
+  m->GotoIf(m->Int32Constant(1), &dummy_done);
+  var.Bind(m->SmiConstant(value));
+  m->Goto(&dummy_done);
+  m->BIND(&dummy_done);
+
+  // Ensure that the above hackery actually created a non-constant SMI.
+  Smi* smi_constant;
+  CHECK(!m->ToSmiConstant(var.value(), smi_constant));
+
+  return m->UncheckedCast<Smi>(var.value());
+}
+
+TEST(ArgumentsWithSmiIndices) {
+  Isolate* isolate(CcTest::InitIsolateOnce());
+
+  const int kNumParams = 4;
+  CodeAssemblerTester asm_tester(isolate, kNumParams);
+  CodeStubAssembler m(asm_tester.state());
+
+  CodeStubArguments arguments(&m, m.SmiConstant(3), nullptr,
+                              CodeStubAssembler::SMI_PARAMETERS);
+
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(NonConstantSmi(&m, 0),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(12))));
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(NonConstantSmi(&m, 1),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(13))));
+  CSA_ASSERT(&m,
+             m.WordEqual(arguments.AtIndex(NonConstantSmi(&m, 2),
+                                           CodeStubAssembler::SMI_PARAMETERS),
+                         m.SmiConstant(Smi::FromInt(14))));
+
+  arguments.PopAndReturn(arguments.GetReceiver());
 
   FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
   Handle<Object> result = ft.Call(isolate->factory()->undefined_value(),
@@ -1746,7 +1821,7 @@ TEST(ArgumentsForEach) {
   arguments.ForEach(
       list, [&m, &sum](Node* arg) { sum.Bind(m.SmiAdd(sum.value(), arg)); });
 
-  m.Return(sum.value());
+  arguments.PopAndReturn(sum.value());
 
   FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
   Handle<Object> result = ft.Call(isolate->factory()->undefined_value(),
@@ -2144,8 +2219,6 @@ TEST(CreatePromiseResolvingFunctionsContext) {
   CHECK_EQ(isolate->native_context()->closure(), context_js->closure());
   CHECK_EQ(isolate->heap()->the_hole_value(), context_js->extension());
   CHECK_EQ(*isolate->native_context(), context_js->native_context());
-  CHECK_EQ(Smi::FromInt(0),
-           context_js->get(PromiseBuiltinsAssembler::kAlreadyVisitedSlot));
   CHECK(context_js->get(PromiseBuiltinsAssembler::kPromiseSlot)->IsJSPromise());
   CHECK_EQ(isolate->heap()->false_value(),
            context_js->get(PromiseBuiltinsAssembler::kDebugEventSlot));
@@ -2677,7 +2750,7 @@ TEST(GotoIfNotWhiteSpaceOrLineTerminator) {
   }
 }
 
-TEST(BranchIfNumericRelationalComparison) {
+TEST(BranchIfNumberRelationalComparison) {
   Isolate* isolate(CcTest::InitIsolateOnce());
   Factory* f = isolate->factory();
   const int kNumParams = 2;
@@ -2685,9 +2758,9 @@ TEST(BranchIfNumericRelationalComparison) {
   {
     CodeStubAssembler m(asm_tester.state());
     Label return_true(&m), return_false(&m);
-    m.BranchIfNumericRelationalComparison(
-        CodeStubAssembler::kGreaterThanOrEqual, m.Parameter(0), m.Parameter(1),
-        &return_true, &return_false);
+    m.BranchIfNumberRelationalComparison(Operation::kGreaterThanOrEqual,
+                                         m.Parameter(0), m.Parameter(1),
+                                         &return_true, &return_false);
     m.BIND(&return_true);
     m.Return(m.BooleanConstant(true));
     m.BIND(&return_false);

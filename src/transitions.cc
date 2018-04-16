@@ -17,7 +17,7 @@ void TransitionsAccessor::Initialize() {
     encoding_ = kUninitialized;
   } else if (HeapObject::cast(raw_transitions_)->IsWeakCell()) {
     encoding_ = kWeakCell;
-  } else if (StoreHandler::IsHandler(raw_transitions_)) {
+  } else if (HeapObject::cast(raw_transitions_)->IsStoreHandler()) {
     encoding_ = kHandler;
   } else if (HeapObject::cast(raw_transitions_)->IsTransitionArray()) {
     encoding_ = kFullTransitionArray;
@@ -250,7 +250,7 @@ Object* TransitionsAccessor::SearchHandler(Name* name,
       int transition = transitions()->Search(kData, name, NONE);
       if (transition == kNotFound) return nullptr;
       Object* raw_handler = transitions()->GetRawTarget(transition);
-      if (StoreHandler::IsHandler(raw_handler)) {
+      if (raw_handler->IsStoreHandler()) {
         return StoreHandler::ValidHandlerOrNull(raw_handler, name,
                                                 out_transition);
       }
@@ -664,24 +664,27 @@ void TransitionArray::Sort() {
   int length = number_of_transitions();
   for (int i = 1; i < length; i++) {
     Name* key = GetKey(i);
-    Map* target = GetTarget(i);
+    Object* target = GetRawTarget(i);
     PropertyKind kind = kData;
     PropertyAttributes attributes = NONE;
     if (!TransitionsAccessor::IsSpecialTransition(key)) {
+      Map* target_map = TransitionsAccessor::GetTargetFromRaw(target);
       PropertyDetails details =
-          TransitionsAccessor::GetTargetDetails(key, target);
+          TransitionsAccessor::GetTargetDetails(key, target_map);
       kind = details.kind();
       attributes = details.attributes();
     }
     int j;
     for (j = i - 1; j >= 0; j--) {
       Name* temp_key = GetKey(j);
-      Map* temp_target = GetTarget(j);
+      Object* temp_target = GetRawTarget(j);
       PropertyKind temp_kind = kData;
       PropertyAttributes temp_attributes = NONE;
       if (!TransitionsAccessor::IsSpecialTransition(temp_key)) {
+        Map* temp_target_map =
+            TransitionsAccessor::GetTargetFromRaw(temp_target);
         PropertyDetails details =
-            TransitionsAccessor::GetTargetDetails(temp_key, temp_target);
+            TransitionsAccessor::GetTargetDetails(temp_key, temp_target_map);
         temp_kind = details.kind();
         temp_attributes = details.attributes();
       }

@@ -9,6 +9,7 @@
 #include "src/accessors.h"
 #include "src/arguments.h"
 #include "src/ast/scopes.h"
+#include "src/bootstrapper.h"
 #include "src/deoptimizer.h"
 #include "src/frames-inl.h"
 #include "src/isolate-inl.h"
@@ -595,11 +596,14 @@ RUNTIME_FUNCTION(Runtime_NewSloppyArguments) {
   iterator.Advance();
   JavaScriptFrame* function_frame = JavaScriptFrame::cast(iterator.frame());
   DCHECK(function_frame->is_java_script());
-  int argc = function_frame->GetArgumentsLength();
+  int argc = function_frame->ComputeParametersCount();
   Address fp = function_frame->fp();
   if (function_frame->has_adapted_arguments()) {
     iterator.Advance();
-    fp = iterator.frame()->fp();
+    ArgumentsAdaptorFrame* adaptor_frame =
+        ArgumentsAdaptorFrame::cast(iterator.frame());
+    argc = adaptor_frame->ComputeParametersCount();
+    fp = adaptor_frame->fp();
   }
 
   Object** parameters = reinterpret_cast<Object**>(
@@ -723,6 +727,9 @@ RUNTIME_FUNCTION(Runtime_NewScriptContext) {
   Handle<JSFunction> closure(function->shared()->IsUserJavaScript()
                                  ? native_context->closure()
                                  : *function);
+
+  // We do not need script contexts here during bootstrap.
+  DCHECK(!isolate->bootstrapper()->IsActive());
   Handle<Context> result =
       isolate->factory()->NewScriptContext(closure, scope_info);
 
@@ -841,7 +848,7 @@ RUNTIME_FUNCTION(Runtime_DeleteLookupSlot) {
 namespace {
 
 MaybeHandle<Object> LoadLookupSlot(Handle<String> name,
-                                   Object::ShouldThrow should_throw,
+                                   ShouldThrow should_throw,
                                    Handle<Object>* receiver_return = nullptr) {
   Isolate* const isolate = name->GetIsolate();
 
@@ -892,7 +899,7 @@ MaybeHandle<Object> LoadLookupSlot(Handle<String> name,
     return value;
   }
 
-  if (should_throw == Object::THROW_ON_ERROR) {
+  if (should_throw == kThrowOnError) {
     // The property doesn't exist - throw exception.
     THROW_NEW_ERROR(
         isolate, NewReferenceError(MessageTemplate::kNotDefined, name), Object);
@@ -910,8 +917,7 @@ RUNTIME_FUNCTION(Runtime_LoadLookupSlot) {
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
   CONVERT_ARG_HANDLE_CHECKED(String, name, 0);
-  RETURN_RESULT_OR_FAILURE(isolate,
-                           LoadLookupSlot(name, Object::THROW_ON_ERROR));
+  RETURN_RESULT_OR_FAILURE(isolate, LoadLookupSlot(name, kThrowOnError));
 }
 
 
@@ -919,7 +925,7 @@ RUNTIME_FUNCTION(Runtime_LoadLookupSlotInsideTypeof) {
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
   CONVERT_ARG_HANDLE_CHECKED(String, name, 0);
-  RETURN_RESULT_OR_FAILURE(isolate, LoadLookupSlot(name, Object::DONT_THROW));
+  RETURN_RESULT_OR_FAILURE(isolate, LoadLookupSlot(name, kDontThrow));
 }
 
 
@@ -931,7 +937,7 @@ RUNTIME_FUNCTION_RETURN_PAIR(Runtime_LoadLookupSlotForCall) {
   Handle<Object> value;
   Handle<Object> receiver;
   ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-      isolate, value, LoadLookupSlot(name, Object::THROW_ON_ERROR, &receiver),
+      isolate, value, LoadLookupSlot(name, kThrowOnError, &receiver),
       MakePair(isolate->heap()->exception(), nullptr));
   return MakePair(*value, *receiver);
 }

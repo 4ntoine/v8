@@ -5,27 +5,36 @@
 vars = {
   'checkout_instrumented_libraries': False,
   'chromium_url': 'https://chromium.googlesource.com',
+  'build_for_node': False,
 }
 
 deps = {
   'v8/build':
-    Var('chromium_url') + '/chromium/src/build.git' + '@' + 'f2dd2d1ca74ded8339c6fd458dc9de9d98059f9e',
+    Var('chromium_url') + '/chromium/src/build.git' + '@' + 'b3a78cd03a95c30ff10f863f736249eb04f0f34d',
   'v8/tools/gyp':
     Var('chromium_url') + '/external/gyp.git' + '@' + 'd61a9397e668fa9843c4aa7da9e79460fe590bfb',
   'v8/third_party/icu':
-    Var('chromium_url') + '/chromium/deps/icu.git' + '@' + '21d33b1a09a77f033478ea4ffffb61e6970f83bd',
+    Var('chromium_url') + '/chromium/deps/icu.git' + '@' + 'c8ca2962b46670ec89071ffd1291688983cd319c',
   'v8/third_party/instrumented_libraries':
-    Var('chromium_url') + '/chromium/src/third_party/instrumented_libraries.git' + '@' + 'e07d437dc8b65ca96ebd3b7d4aa303cd2ec0ec45',
+    Var('chromium_url') + '/chromium/src/third_party/instrumented_libraries.git' + '@' + 'b7578b4132cf73ca3265e2ee0b7bd0a422a54ebf',
   'v8/buildtools':
-    Var('chromium_url') + '/chromium/buildtools.git' + '@' + 'e043d81e9185a2445fa3ec3fc34a4f69b58d4969',
+    Var('chromium_url') + '/chromium/buildtools.git' + '@' + '6fe4a3251488f7af86d64fc25cf442e817cf6133',
   'v8/base/trace_event/common':
     Var('chromium_url') + '/chromium/src/base/trace_event/common.git' + '@' + '0e9a47d74970bee1bbfc063c47215406f8918699',
+  'v8/third_party/android_ndk': {
+    'url': Var('chromium_url') + '/android_ndk.git' + '@' + 'e951c37287c7d8cd915bf8d4149fd4a06d808b55',
+    'condition': 'checkout_android',
+  },
   'v8/third_party/android_tools': {
-    'url': Var('chromium_url') + '/android_tools.git' + '@' + '110e5f6c0dcb6f7d586ac0c00f10bc7d1d410088',
+    'url': Var('chromium_url') + '/android_tools.git' + '@' + 'c78b25872734e0038ae2a333edc645cd96bc232d',
     'condition': 'checkout_android',
   },
   'v8/third_party/catapult': {
-    'url': Var('chromium_url') + '/catapult.git' + '@' + '22e74ebb13a5b87981c4a2f6a8594390f2496d0b',
+    'url': Var('chromium_url') + '/catapult.git' + '@' + 'b4826a52853c9c2778d496f6c6fa853f777f94df',
+    'condition': 'checkout_android',
+  },
+  'v8/third_party/colorama/src': {
+    'url': Var('chromium_url') + '/external/colorama.git' + '@' + '799604a1041e9b3bc5d2789ecbd7e8db2e18e6b8',
     'condition': 'checkout_android',
   },
   'v8/third_party/jinja2':
@@ -33,7 +42,7 @@ deps = {
   'v8/third_party/markupsafe':
     Var('chromium_url') + '/chromium/src/third_party/markupsafe.git' + '@' + '8f45f5cfa0009d2a70589bcda0349b8cb2b72783',
   'v8/tools/swarming_client':
-    Var('chromium_url') + '/infra/luci/client-py.git' + '@' + '5e8001d9a710121ce7a68efd0804430a34b4f9e4',
+    Var('chromium_url') + '/infra/luci/client-py.git' + '@' + '88229872dd17e71658fe96763feaa77915d8cbd6',
   'v8/testing/gtest':
     Var('chromium_url') + '/external/github.com/google/googletest.git' + '@' + '6f8a66431cb592dad629028a50b3dd418a408c87',
   'v8/testing/gmock':
@@ -43,15 +52,15 @@ deps = {
   'v8/test/mozilla/data':
     Var('chromium_url') + '/v8/deps/third_party/mozilla-tests.git' + '@' + 'f6c578a10ea707b1a8ab0b88943fe5115ce2b9be',
   'v8/test/test262/data':
-    Var('chromium_url') + '/external/github.com/tc39/test262.git' + '@' + '5d4c667b271a9b39d0de73aef5ffe6879c6f8811',
+    Var('chromium_url') + '/external/github.com/tc39/test262.git' + '@' + '8311965251953d4745aeb68c98fb71fab2eac1d0',
   'v8/test/test262/harness':
     Var('chromium_url') + '/external/github.com/test262-utils/test262-harness-py.git' + '@' + '0f2acdd882c84cff43b9d60df7574a1901e2cdcd',
   'v8/tools/clang':
-    Var('chromium_url') + '/chromium/src/tools/clang.git' + '@' + '2a5ee2c0cd6da0f6b72d60d1bedc7d579d776898',
+    Var('chromium_url') + '/chromium/src/tools/clang.git' + '@' + '27088876ff821e8a1518383576a43662a3255d56',
   'v8/tools/luci-go':
-    Var('chromium_url') + '/chromium/src/tools/luci-go.git' + '@' + '45a8a51fda92e123619a69e7644d9c64a320b0c1',
+    Var('chromium_url') + '/chromium/src/tools/luci-go.git' + '@' + 'd882048313f6f51df29856406fa03b620c1d0205',
   'v8/test/wasm-js':
-    Var('chromium_url') + '/external/github.com/WebAssembly/spec.git' + '@' + '89573ee3eabc690637deeb1b8dadec13a963ec30',
+    Var('chromium_url') + '/external/github.com/WebAssembly/spec.git' + '@' + 'a25083ac7076b05e3f304ec9e093ef1b1ee09422',
 }
 
 recursedeps = [
@@ -89,7 +98,7 @@ hooks = [
   {
     'name': 'clang_format_win',
     'pattern': '.',
-    'condition': 'host_os == "win"',
+    'condition': 'host_os == "win" and build_for_node != True',
     'action': [ 'download_from_google_storage',
                 '--no_resume',
                 '--platform=win32',
@@ -101,7 +110,7 @@ hooks = [
   {
     'name': 'clang_format_mac',
     'pattern': '.',
-    'condition': 'host_os == "mac"',
+    'condition': 'host_os == "mac" and build_for_node != True',
     'action': [ 'download_from_google_storage',
                 '--no_resume',
                 '--platform=darwin',
@@ -113,7 +122,7 @@ hooks = [
   {
     'name': 'clang_format_linux',
     'pattern': '.',
-    'condition': 'host_os == "linux"',
+    'condition': 'host_os == "linux" and build_for_node != True',
     'action': [ 'download_from_google_storage',
                 '--no_resume',
                 '--platform=linux*',
@@ -125,6 +134,7 @@ hooks = [
   {
     'name': 'gcmole',
     'pattern': '.',
+    'condition': 'build_for_node != True',
     # TODO(machenbach): Insert condition and remove GYP_DEFINES dependency.
     'action': [
         'python',
@@ -134,6 +144,7 @@ hooks = [
   {
     'name': 'jsfunfuzz',
     'pattern': '.',
+    'condition': 'build_for_node != True',
     # TODO(machenbach): Insert condition and remove GYP_DEFINES dependency.
     'action': [
         'python',
@@ -144,7 +155,7 @@ hooks = [
   {
     'name': 'luci-go_win',
     'pattern': '.',
-    'condition': 'host_os == "win"',
+    'condition': 'host_os == "win" and build_for_node != True',
     'action': [ 'download_from_google_storage',
                 '--no_resume',
                 '--platform=win32',
@@ -156,7 +167,7 @@ hooks = [
   {
     'name': 'luci-go_mac',
     'pattern': '.',
-    'condition': 'host_os == "mac"',
+    'condition': 'host_os == "mac" and build_for_node != True',
     'action': [ 'download_from_google_storage',
                 '--no_resume',
                 '--platform=darwin',
@@ -168,7 +179,7 @@ hooks = [
   {
     'name': 'luci-go_linux',
     'pattern': '.',
-    'condition': 'host_os == "linux"',
+    'condition': 'host_os == "linux" and build_for_node != True',
     'action': [ 'download_from_google_storage',
                 '--no_resume',
                 '--platform=linux*',
@@ -217,6 +228,7 @@ hooks = [
   {
     'name': 'wasm_spec_tests',
     'pattern': '.',
+    'condition': 'build_for_node != True',
     'action': [ 'download_from_google_storage',
                 '--no_resume',
                 '--no_auth',
@@ -228,6 +240,7 @@ hooks = [
   {
     'name': 'closure_compiler',
     'pattern': '.',
+    'condition': 'build_for_node != True',
     'action': [ 'download_from_google_storage',
                 '--no_resume',
                 '--no_auth',
@@ -242,6 +255,7 @@ hooks = [
     # change.
     'name': 'sysroot',
     'pattern': '.',
+    'condition': 'build_for_node != True',
     'action': [
         'python',
         'v8/build/linux/sysroot_scripts/install-sysroot.py',
@@ -283,7 +297,7 @@ hooks = [
   {
     'name': 'binutils',
     'pattern': 'v8/third_party/binutils',
-    'condition': 'host_os == "linux"',
+    'condition': 'host_os == "linux" and build_for_node != True',
     'action': [
         'python',
         'v8/third_party/binutils/download.py',
@@ -309,6 +323,17 @@ hooks = [
     # A change to a .gyp, .gypi, or to GYP itself should run the generator.
     'name': 'regyp_if_needed',
     'pattern': '.',
+    'condition': 'build_for_node != True',
     'action': ['python', 'v8/gypfiles/gyp_v8', '--running-as-hook'],
+  },
+  # Download and initialize "vpython" VirtualEnv environment packages.
+  {
+    'name': 'vpython_common',
+    'pattern': '.',
+    'condition': 'checkout_android',
+    'action': [ 'vpython',
+                '-vpython-spec', 'v8/.vpython',
+                '-vpython-tool', 'install',
+    ],
   },
 ]

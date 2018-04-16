@@ -72,7 +72,7 @@ static unsigned CpuFeaturesFromCommandLine() {
             "                       armv7+sudiv\n"
             "                       armv7\n"
             "                       armv6\n");
-    CHECK(false);
+    FATAL("arm-arch");
   }
 
   // If any of the old (deprecated) flags are specified, print a warning, but
@@ -339,22 +339,35 @@ bool RelocInfo::IsInConstantPool() {
 }
 
 Address RelocInfo::embedded_address() const {
-  return Assembler::target_address_at(pc_, host_);
+  return Assembler::target_address_at(pc_, constant_pool_);
 }
 
 uint32_t RelocInfo::embedded_size() const {
-  return reinterpret_cast<uint32_t>(Assembler::target_address_at(pc_, host_));
+  return reinterpret_cast<uint32_t>(
+      Assembler::target_address_at(pc_, constant_pool_));
 }
 
 void RelocInfo::set_embedded_address(Isolate* isolate, Address address,
                                      ICacheFlushMode flush_mode) {
-  Assembler::set_target_address_at(isolate, pc_, host_, address, flush_mode);
+  Assembler::set_target_address_at(isolate, pc_, constant_pool_, address,
+                                   flush_mode);
 }
 
 void RelocInfo::set_embedded_size(Isolate* isolate, uint32_t size,
                                   ICacheFlushMode flush_mode) {
-  Assembler::set_target_address_at(isolate, pc_, host_,
+  Assembler::set_target_address_at(isolate, pc_, constant_pool_,
                                    reinterpret_cast<Address>(size), flush_mode);
+}
+
+void RelocInfo::set_js_to_wasm_address(Isolate* isolate, Address address,
+                                       ICacheFlushMode icache_flush_mode) {
+  DCHECK_EQ(rmode_, JS_TO_WASM_CALL);
+  set_embedded_address(isolate, address, icache_flush_mode);
+}
+
+Address RelocInfo::js_to_wasm_address() const {
+  DCHECK_EQ(rmode_, JS_TO_WASM_CALL);
+  return embedded_address();
 }
 
 // -----------------------------------------------------------------------------
@@ -463,7 +476,6 @@ void NeonMemOperand::SetAlignment(int align) {
       break;
     default:
       UNREACHABLE();
-      align_ = 0;
       break;
   }
 }
@@ -508,23 +520,23 @@ const Instr kBlxRegMask =
 const Instr kBlxRegPattern =
     B24 | B21 | 15 * B16 | 15 * B12 | 15 * B8 | BLX;
 const Instr kBlxIp = al | kBlxRegPattern | ip.code();
-const Instr kMovMvnMask = 0x6d * B21 | 0xf * B16;
-const Instr kMovMvnPattern = 0xd * B21;
+const Instr kMovMvnMask = 0x6D * B21 | 0xF * B16;
+const Instr kMovMvnPattern = 0xD * B21;
 const Instr kMovMvnFlip = B22;
-const Instr kMovLeaveCCMask = 0xdff * B16;
-const Instr kMovLeaveCCPattern = 0x1a0 * B16;
+const Instr kMovLeaveCCMask = 0xDFF * B16;
+const Instr kMovLeaveCCPattern = 0x1A0 * B16;
 const Instr kMovwPattern = 0x30 * B20;
 const Instr kMovtPattern = 0x34 * B20;
 const Instr kMovwLeaveCCFlip = 0x5 * B21;
-const Instr kMovImmedMask = 0x7f * B21;
-const Instr kMovImmedPattern = 0x1d * B21;
-const Instr kOrrImmedMask = 0x7f * B21;
-const Instr kOrrImmedPattern = 0x1c * B21;
-const Instr kCmpCmnMask = 0xdd * B20 | 0xf * B12;
+const Instr kMovImmedMask = 0x7F * B21;
+const Instr kMovImmedPattern = 0x1D * B21;
+const Instr kOrrImmedMask = 0x7F * B21;
+const Instr kOrrImmedPattern = 0x1C * B21;
+const Instr kCmpCmnMask = 0xDD * B20 | 0xF * B12;
 const Instr kCmpCmnPattern = 0x15 * B20;
 const Instr kCmpCmnFlip = B21;
 const Instr kAddSubFlip = 0x6 * B21;
-const Instr kAndBicFlip = 0xe * B21;
+const Instr kAndBicFlip = 0xE * B21;
 
 // A mask for the Rd register for push, pop, ldr, str instructions.
 const Instr kLdrRegFpOffsetPattern = al | B26 | L | Offset | fp.code() * B16;
@@ -532,7 +544,7 @@ const Instr kStrRegFpOffsetPattern = al | B26 | Offset | fp.code() * B16;
 const Instr kLdrRegFpNegOffsetPattern =
     al | B26 | L | NegOffset | fp.code() * B16;
 const Instr kStrRegFpNegOffsetPattern = al | B26 | NegOffset | fp.code() * B16;
-const Instr kLdrStrInstrTypeMask = 0xffff0000;
+const Instr kLdrStrInstrTypeMask = 0xFFFF0000;
 
 Assembler::Assembler(IsolateData isolate_data, void* buffer, int buffer_size)
     : AssemblerBase(isolate_data, buffer, buffer_size),
@@ -930,14 +942,14 @@ void Assembler::target_at_put(int pos, int target_pos) {
   instr_at_put(pos, instr | (imm24 & kImm24Mask));
 }
 
-
-void Assembler::print(Label* L) {
+void Assembler::print(const Label* L) {
   if (L->is_unused()) {
     PrintF("unused label\n");
   } else if (L->is_bound()) {
     PrintF("bound label to %d\n", L->pos());
   } else if (L->is_linked()) {
-    Label l = *L;
+    Label l;
+    l.link_to(L->pos());
     PrintF("unbound label");
     while (l.is_linked()) {
       PrintF("@ %d ", l.pos());
@@ -1035,7 +1047,7 @@ bool FitsShifter(uint32_t imm32, uint32_t* rotate_imm, uint32_t* immed_8,
   // imm32 must be unsigned.
   for (int rot = 0; rot < 16; rot++) {
     uint32_t imm8 = base::bits::RotateLeft32(imm32, 2 * rot);
-    if ((imm8 <= 0xff)) {
+    if ((imm8 <= 0xFF)) {
       *rotate_imm = rot;
       *immed_8 = imm8;
       return true;
@@ -1161,7 +1173,7 @@ void Assembler::Move32BitImmediate(Register rd, const Operand& x,
     if (CpuFeatures::IsSupported(ARMv7)) {
       uint32_t imm32 = static_cast<uint32_t>(x.immediate());
       CpuFeatureScope scope(this, ARMv7);
-      movw(target, imm32 & 0xffff, cond);
+      movw(target, imm32 & 0xFFFF, cond);
       movt(target, imm32 >> 16, cond);
     }
     if (target.code() != rd.code()) {
@@ -1176,7 +1188,7 @@ void Assembler::Move32BitImmediate(Register rd, const Operand& x,
       immediate = x.immediate();
     }
     ConstantPoolAddEntry(pc_offset(), x.rmode_, immediate);
-    ldr(rd, MemOperand(pc, 0), cond);
+    ldr_pcrel(rd, 0, cond);
   }
 }
 
@@ -1223,7 +1235,7 @@ void Assembler::AddrMode1(Instr instr, Register rd, Register rn,
         // This means that finding the even number of trailing zeroes of the
         // immediate allows us to more efficiently split it:
         int trailing_zeroes = base::bits::CountTrailingZeros(imm) & ~1u;
-        uint32_t mask = (0xff << trailing_zeroes);
+        uint32_t mask = (0xFF << trailing_zeroes);
         add(rd, rd, Operand(imm & mask), LeaveCC, cond);
         imm = imm & ~mask;
       } while (!ImmediateFitsAddrMode1Instruction(imm));
@@ -1283,6 +1295,9 @@ bool Assembler::AddrMode1TryEncodeOperand(Instr* instr, const Operand& x) {
 
 void Assembler::AddrMode2(Instr instr, Register rd, const MemOperand& x) {
   DCHECK((instr & ~(kCondMask | B | L)) == B26);
+  // This method does not handle pc-relative addresses. ldr_pcrel() should be
+  // used instead.
+  DCHECK(x.rn_ != pc);
   int am = x.am_;
   if (!x.rm_.is_valid()) {
     // Immediate offset.
@@ -1320,6 +1335,9 @@ void Assembler::AddrMode2(Instr instr, Register rd, const MemOperand& x) {
 void Assembler::AddrMode3(Instr instr, Register rd, const MemOperand& x) {
   DCHECK((instr & ~(kCondMask | L | S6 | H)) == (B4 | B7));
   DCHECK(x.rn_.is_valid());
+  // This method does not handle pc-relative addresses. ldr_pcrel() should be
+  // used instead.
+  DCHECK(x.rn_ != pc);
   int am = x.am_;
   bool is_load = (instr & L) == L;
   if (!x.rm_.is_valid()) {
@@ -1342,7 +1360,7 @@ void Assembler::AddrMode3(Instr instr, Register rd, const MemOperand& x) {
       return;
     }
     DCHECK_GE(offset_8, 0);  // no masking needed
-    instr |= B | (offset_8 >> 4)*B8 | (offset_8 & 0xf);
+    instr |= B | (offset_8 >> 4) * B8 | (offset_8 & 0xF);
   } else if (x.shift_imm_ != 0) {
     // Scaled register offsets are not supported, compute the offset separately
     // to a scratch register.
@@ -1698,8 +1716,8 @@ void Assembler::sdiv(Register dst, Register src1, Register src2,
                      Condition cond) {
   DCHECK(dst != pc && src1 != pc && src2 != pc);
   DCHECK(IsEnabled(SUDIV));
-  emit(cond | B26 | B25| B24 | B20 | dst.code()*B16 | 0xf * B12 |
-       src2.code()*B8 | B4 | src1.code());
+  emit(cond | B26 | B25 | B24 | B20 | dst.code() * B16 | 0xF * B12 |
+       src2.code() * B8 | B4 | src1.code());
 }
 
 
@@ -1707,7 +1725,7 @@ void Assembler::udiv(Register dst, Register src1, Register src2,
                      Condition cond) {
   DCHECK(dst != pc && src1 != pc && src2 != pc);
   DCHECK(IsEnabled(SUDIV));
-  emit(cond | B26 | B25 | B24 | B21 | B20 | dst.code() * B16 | 0xf * B12 |
+  emit(cond | B26 | B25 | B24 | B21 | B20 | dst.code() * B16 | 0xF * B12 |
        src2.code() * B8 | B4 | src1.code());
 }
 
@@ -1731,7 +1749,7 @@ void Assembler::smmla(Register dst, Register src1, Register src2, Register srcA,
 void Assembler::smmul(Register dst, Register src1, Register src2,
                       Condition cond) {
   DCHECK(dst != pc && src1 != pc && src2 != pc);
-  emit(cond | B26 | B25 | B24 | B22 | B20 | dst.code() * B16 | 0xf * B12 |
+  emit(cond | B26 | B25 | B24 | B22 | B20 | dst.code() * B16 | 0xF * B12 |
        src2.code() * B8 | B4 | src1.code());
 }
 
@@ -1813,8 +1831,8 @@ void Assembler::usat(Register dst,
       sh = 1;
   }
 
-  emit(cond | 0x6*B24 | 0xe*B20 | satpos*B16 | dst.code()*B12 |
-       src.shift_imm_*B7 | sh*B6 | 0x1*B4 | src.rm_.code());
+  emit(cond | 0x6 * B24 | 0xE * B20 | satpos * B16 | dst.code() * B12 |
+       src.shift_imm_ * B7 | sh * B6 | 0x1 * B4 | src.rm_.code());
 }
 
 
@@ -1833,8 +1851,8 @@ void Assembler::ubfx(Register dst,
   DCHECK(dst != pc && src != pc);
   DCHECK((lsb >= 0) && (lsb <= 31));
   DCHECK((width >= 1) && (width <= (32 - lsb)));
-  emit(cond | 0xf*B23 | B22 | B21 | (width - 1)*B16 | dst.code()*B12 |
-       lsb*B7 | B6 | B4 | src.code());
+  emit(cond | 0xF * B23 | B22 | B21 | (width - 1) * B16 | dst.code() * B12 |
+       lsb * B7 | B6 | B4 | src.code());
 }
 
 
@@ -1852,8 +1870,8 @@ void Assembler::sbfx(Register dst,
   DCHECK(dst != pc && src != pc);
   DCHECK((lsb >= 0) && (lsb <= 31));
   DCHECK((width >= 1) && (width <= (32 - lsb)));
-  emit(cond | 0xf*B23 | B21 | (width - 1)*B16 | dst.code()*B12 |
-       lsb*B7 | B6 | B4 | src.code());
+  emit(cond | 0xF * B23 | B21 | (width - 1) * B16 | dst.code() * B12 |
+       lsb * B7 | B6 | B4 | src.code());
 }
 
 
@@ -1867,7 +1885,7 @@ void Assembler::bfc(Register dst, int lsb, int width, Condition cond) {
   DCHECK((lsb >= 0) && (lsb <= 31));
   DCHECK((width >= 1) && (width <= (32 - lsb)));
   int msb = lsb + width - 1;
-  emit(cond | 0x1f*B22 | msb*B16 | dst.code()*B12 | lsb*B7 | B4 | 0xf);
+  emit(cond | 0x1F * B22 | msb * B16 | dst.code() * B12 | lsb * B7 | B4 | 0xF);
 }
 
 
@@ -1885,7 +1903,7 @@ void Assembler::bfi(Register dst,
   DCHECK((lsb >= 0) && (lsb <= 31));
   DCHECK((width >= 1) && (width <= (32 - lsb)));
   int msb = lsb + width - 1;
-  emit(cond | 0x1f*B22 | msb*B16 | dst.code()*B12 | lsb*B7 | B4 |
+  emit(cond | 0x1F * B22 | msb * B16 | dst.code() * B12 | lsb * B7 | B4 |
        src.code());
 }
 
@@ -2062,8 +2080,8 @@ void Assembler::mrs(Register dst, SRegister s, Condition cond) {
 
 void Assembler::msr(SRegisterFieldMask fields, const Operand& src,
                     Condition cond) {
-  DCHECK_NE(fields & 0x000f0000, 0);  // At least one field must be set.
-  DCHECK(((fields & 0xfff0ffff) == CPSR) || ((fields & 0xfff0ffff) == SPSR));
+  DCHECK_NE(fields & 0x000F0000, 0);  // At least one field must be set.
+  DCHECK(((fields & 0xFFF0FFFF) == CPSR) || ((fields & 0xFFF0FFFF) == SPSR));
   Instr instr;
   if (src.IsImmediate()) {
     // Immediate.
@@ -2148,11 +2166,23 @@ void Assembler::strd(Register src1, Register src2,
   AddrMode3(cond | B7 | B6 | B5 | B4, src1, dst);
 }
 
+void Assembler::ldr_pcrel(Register dst, int imm12, Condition cond) {
+  AddrMode am = Offset;
+  if (imm12 < 0) {
+    imm12 = -imm12;
+    am = NegOffset;
+  }
+  DCHECK(is_uint12(imm12));
+  emit(cond | B26 | am | L | pc.code() * B16 | dst.code() * B12 | imm12);
+}
+
 // Load/Store exclusive instructions.
 void Assembler::ldrex(Register dst, Register src, Condition cond) {
   // Instruction details available in ARM DDI 0406C.b, A8.8.75.
   // cond(31-28) | 00011001(27-20) | Rn(19-16) | Rt(15-12) | 111110011111(11-0)
-  emit(cond | B24 | B23 | B20 | src.code() * B16 | dst.code() * B12 | 0xf9f);
+  DCHECK(dst != pc);
+  DCHECK(src != pc);
+  emit(cond | B24 | B23 | B20 | src.code() * B16 | dst.code() * B12 | 0xF9F);
 }
 
 void Assembler::strex(Register src1, Register src2, Register dst,
@@ -2160,15 +2190,22 @@ void Assembler::strex(Register src1, Register src2, Register dst,
   // Instruction details available in ARM DDI 0406C.b, A8.8.212.
   // cond(31-28) | 00011000(27-20) | Rn(19-16) | Rd(15-12) | 11111001(11-4) |
   // Rt(3-0)
-  emit(cond | B24 | B23 | dst.code() * B16 | src1.code() * B12 | 0xf9 * B4 |
+  DCHECK(dst != pc);
+  DCHECK(src1 != pc);
+  DCHECK(src2 != pc);
+  DCHECK(src1 != dst);
+  DCHECK(src1 != src2);
+  emit(cond | B24 | B23 | dst.code() * B16 | src1.code() * B12 | 0xF9 * B4 |
        src2.code());
 }
 
 void Assembler::ldrexb(Register dst, Register src, Condition cond) {
   // Instruction details available in ARM DDI 0406C.b, A8.8.76.
   // cond(31-28) | 00011101(27-20) | Rn(19-16) | Rt(15-12) | 111110011111(11-0)
+  DCHECK(dst != pc);
+  DCHECK(src != pc);
   emit(cond | B24 | B23 | B22 | B20 | src.code() * B16 | dst.code() * B12 |
-       0xf9f);
+       0xF9F);
 }
 
 void Assembler::strexb(Register src1, Register src2, Register dst,
@@ -2176,15 +2213,22 @@ void Assembler::strexb(Register src1, Register src2, Register dst,
   // Instruction details available in ARM DDI 0406C.b, A8.8.213.
   // cond(31-28) | 00011100(27-20) | Rn(19-16) | Rd(15-12) | 11111001(11-4) |
   // Rt(3-0)
+  DCHECK(dst != pc);
+  DCHECK(src1 != pc);
+  DCHECK(src2 != pc);
+  DCHECK(src1 != dst);
+  DCHECK(src1 != src2);
   emit(cond | B24 | B23 | B22 | dst.code() * B16 | src1.code() * B12 |
-       0xf9 * B4 | src2.code());
+       0xF9 * B4 | src2.code());
 }
 
 void Assembler::ldrexh(Register dst, Register src, Condition cond) {
   // Instruction details available in ARM DDI 0406C.b, A8.8.78.
   // cond(31-28) | 00011111(27-20) | Rn(19-16) | Rt(15-12) | 111110011111(11-0)
+  DCHECK(dst != pc);
+  DCHECK(src != pc);
   emit(cond | B24 | B23 | B22 | B21 | B20 | src.code() * B16 |
-       dst.code() * B12 | 0xf9f);
+       dst.code() * B12 | 0xF9F);
 }
 
 void Assembler::strexh(Register src1, Register src2, Register dst,
@@ -2192,8 +2236,13 @@ void Assembler::strexh(Register src1, Register src2, Register dst,
   // Instruction details available in ARM DDI 0406C.b, A8.8.215.
   // cond(31-28) | 00011110(27-20) | Rn(19-16) | Rd(15-12) | 11111001(11-4) |
   // Rt(3-0)
+  DCHECK(dst != pc);
+  DCHECK(src1 != pc);
+  DCHECK(src2 != pc);
+  DCHECK(src1 != dst);
+  DCHECK(src1 != src2);
   emit(cond | B24 | B23 | B22 | B21 | dst.code() * B16 | src1.code() * B12 |
-       0xf9 * B4 | src2.code());
+       0xF9 * B4 | src2.code());
 }
 
 // Preload instructions.
@@ -2210,8 +2259,8 @@ void Assembler::pld(const MemOperand& address) {
     U = 0;
   }
   DCHECK_LT(offset, 4096);
-  emit(kSpecialCondition | B26 | B24 | U | B22 | B20 | address.rn().code()*B16 |
-       0xf*B12 | offset);
+  emit(kSpecialCondition | B26 | B24 | U | B22 | B20 |
+       address.rn().code() * B16 | 0xF * B12 | offset);
 }
 
 
@@ -2273,7 +2322,7 @@ void Assembler::stop(const char* msg, Condition cond, int32_t code) {
 
 void Assembler::bkpt(uint32_t imm16) {
   DCHECK(is_uint16(imm16));
-  emit(al | B24 | B21 | (imm16 >> 4)*B8 | BKPT | (imm16 & 0xf));
+  emit(al | B24 | B21 | (imm16 >> 4) * B8 | BKPT | (imm16 & 0xF));
 }
 
 
@@ -2286,7 +2335,7 @@ void Assembler::svc(uint32_t imm24, Condition cond) {
 void Assembler::dmb(BarrierOption option) {
   if (CpuFeatures::IsSupported(ARMv7)) {
     // Details available in ARM DDI 0406C.b, A8-378.
-    emit(kSpecialCondition | 0x57ff * B12 | 5 * B4 | option);
+    emit(kSpecialCondition | 0x57FF * B12 | 5 * B4 | option);
   } else {
     // Details available in ARM DDI 0406C.b, B3-1750.
     // CP15DMB: CRn=c7, opc1=0, CRm=c10, opc2=5, Rt is ignored.
@@ -2298,7 +2347,7 @@ void Assembler::dmb(BarrierOption option) {
 void Assembler::dsb(BarrierOption option) {
   if (CpuFeatures::IsSupported(ARMv7)) {
     // Details available in ARM DDI 0406C.b, A8-380.
-    emit(kSpecialCondition | 0x57ff * B12 | 4 * B4 | option);
+    emit(kSpecialCondition | 0x57FF * B12 | 4 * B4 | option);
   } else {
     // Details available in ARM DDI 0406C.b, B3-1750.
     // CP15DSB: CRn=c7, opc1=0, CRm=c10, opc2=4, Rt is ignored.
@@ -2310,7 +2359,7 @@ void Assembler::dsb(BarrierOption option) {
 void Assembler::isb(BarrierOption option) {
   if (CpuFeatures::IsSupported(ARMv7)) {
     // Details available in ARM DDI 0406C.b, A8-389.
-    emit(kSpecialCondition | 0x57ff * B12 | 6 * B4 | option);
+    emit(kSpecialCondition | 0x57FF * B12 | 6 * B4 | option);
   } else {
     // Details available in ARM DDI 0406C.b, B3-1750.
     // CP15ISB: CRn=c7, opc1=0, CRm=c5, opc2=4, Rt is ignored.
@@ -2696,7 +2745,7 @@ void Assembler::vstm(BlockAddrMode am, Register base, SwVfpRegister first,
 static void DoubleAsTwoUInt32(Double d, uint32_t* lo, uint32_t* hi) {
   uint64_t i = d.AsUint64();
 
-  *lo = i & 0xffffffff;
+  *lo = i & 0xFFFFFFFF;
   *hi = i >> 32;
 }
 
@@ -2725,12 +2774,12 @@ static bool FitsVmovFPImmediate(Double d, uint32_t* encoding) {
   DoubleAsTwoUInt32(d, &lo, &hi);
 
   // The most obvious constraint is the long block of zeroes.
-  if ((lo != 0) || ((hi & 0xffff) != 0)) {
+  if ((lo != 0) || ((hi & 0xFFFF) != 0)) {
     return false;
   }
 
   // Bits 61:54 must be all clear or all set.
-  if (((hi & 0x3fc00000) != 0) && ((hi & 0x3fc00000) != 0x3fc00000)) {
+  if (((hi & 0x3FC00000) != 0) && ((hi & 0x3FC00000) != 0x3FC00000)) {
     return false;
   }
 
@@ -2741,7 +2790,7 @@ static bool FitsVmovFPImmediate(Double d, uint32_t* encoding) {
 
   // Create the encoded immediate in the form:
   //  [00000000,0000abcd,00000000,0000efgh]
-  *encoding  = (hi >> 16) & 0xf;      // Low nybble.
+  *encoding = (hi >> 16) & 0xF;       // Low nybble.
   *encoding |= (hi >> 4) & 0x70000;   // Low three bits of the high nybble.
   *encoding |= (hi >> 12) & 0x80000;  // Top bit of the high nybble.
 
@@ -2820,8 +2869,7 @@ void Assembler::vmov(const DwVfpRegister dst, Double imm,
       // We only have one spare scratch register.
       mov(scratch, Operand(lo));
       vmov(dst, VmovIndexLo, scratch);
-      if (((lo & 0xffff) == (hi & 0xffff)) &&
-          CpuFeatures::IsSupported(ARMv7)) {
+      if (((lo & 0xFFFF) == (hi & 0xFFFF)) && CpuFeatures::IsSupported(ARMv7)) {
         CpuFeatureScope scope(this, ARMv7);
         movt(scratch, hi >> 16);
       } else {
@@ -3161,7 +3209,7 @@ void Assembler::vcvt_f64_s32(const DwVfpRegister dst,
   dst.split_code(&vd, &d);
   int imm5 = 32 - fraction_bits;
   int i = imm5 & 1;
-  int imm4 = (imm5 >> 1) & 0xf;
+  int imm4 = (imm5 >> 1) & 0xF;
   emit(cond | 0xE*B24 | B23 | d*B22 | 0x3*B20 | B19 | 0x2*B16 |
        vd*B12 | 0x5*B9 | B8 | B7 | B6 | i*B5 | imm4);
 }
@@ -4941,12 +4989,12 @@ Instr Assembler::GetMovWPattern() { return kMovwPattern; }
 
 Instr Assembler::EncodeMovwImmediate(uint32_t immediate) {
   DCHECK_LT(immediate, 0x10000);
-  return ((immediate & 0xf000) << 4) | (immediate & 0xfff);
+  return ((immediate & 0xF000) << 4) | (immediate & 0xFFF);
 }
 
 
 Instr Assembler::PatchMovwImmediate(Instr instruction, uint32_t immediate) {
-  instruction &= ~EncodeMovwImmediate(0xffff);
+  instruction &= ~EncodeMovwImmediate(0xFFFF);
   return instruction | EncodeMovwImmediate(immediate);
 }
 

@@ -45,6 +45,15 @@ int MarkingVisitor<fixed_array_mode, retaining_path_mode,
 
 template <FixedArrayVisitationMode fixed_array_mode,
           TraceRetainingPathMode retaining_path_mode, typename MarkingState>
+int MarkingVisitor<fixed_array_mode, retaining_path_mode, MarkingState>::
+    VisitCodeDataContainer(Map* map, CodeDataContainer* object) {
+  int size = CodeDataContainer::BodyDescriptorWeak::SizeOf(map, object);
+  CodeDataContainer::BodyDescriptorWeak::IterateBody(object, size, this);
+  return size;
+}
+
+template <FixedArrayVisitationMode fixed_array_mode,
+          TraceRetainingPathMode retaining_path_mode, typename MarkingState>
 int MarkingVisitor<fixed_array_mode, retaining_path_mode,
                    MarkingState>::VisitFixedArray(Map* map,
                                                   FixedArray* object) {
@@ -316,7 +325,7 @@ void MarkingVisitor<fixed_array_mode, retaining_path_mode,
 }
 
 void MarkCompactCollector::MarkObject(HeapObject* host, HeapObject* obj) {
-  if (atomic_marking_state()->WhiteToGrey(obj)) {
+  if (marking_state()->WhiteToGrey(obj)) {
     marking_worklist()->Push(obj);
     if (V8_UNLIKELY(FLAG_track_retaining_path)) {
       heap_->AddRetainer(host, obj);
@@ -325,7 +334,7 @@ void MarkCompactCollector::MarkObject(HeapObject* host, HeapObject* obj) {
 }
 
 void MarkCompactCollector::MarkRootObject(Root root, HeapObject* obj) {
-  if (atomic_marking_state()->WhiteToGrey(obj)) {
+  if (marking_state()->WhiteToGrey(obj)) {
     marking_worklist()->Push(obj);
     if (V8_UNLIKELY(FLAG_track_retaining_path)) {
       heap_->AddRetainingRoot(root, obj);
@@ -334,7 +343,7 @@ void MarkCompactCollector::MarkRootObject(Root root, HeapObject* obj) {
 }
 
 void MarkCompactCollector::MarkExternallyReferencedObject(HeapObject* obj) {
-  if (atomic_marking_state()->WhiteToGrey(obj)) {
+  if (marking_state()->WhiteToGrey(obj)) {
     marking_worklist()->Push(obj);
     if (V8_UNLIKELY(FLAG_track_retaining_path)) {
       heap_->AddRetainingRoot(Root::kWrapperTracing, obj);
@@ -393,13 +402,13 @@ void LiveObjectRange<mode>::iterator::AdvanceToNextValidObject() {
     HeapObject* object = nullptr;
     int size = 0;
     while (current_cell_ != 0) {
-      uint32_t trailing_zeros = base::bits::CountTrailingZeros32(current_cell_);
+      uint32_t trailing_zeros = base::bits::CountTrailingZeros(current_cell_);
       Address addr = cell_base_ + trailing_zeros * kPointerSize;
 
       // Clear the first bit of the found object..
       current_cell_ &= ~(1u << trailing_zeros);
 
-      uint32_t second_bit_index = 1u << (trailing_zeros + 1);
+      uint32_t second_bit_index = 0;
       if (trailing_zeros >= Bitmap::kBitIndexMask) {
         second_bit_index = 0x1;
         // The overlapping case; there has to exist a cell after the current
@@ -414,6 +423,8 @@ void LiveObjectRange<mode>::iterator::AdvanceToNextValidObject() {
         }
         cell_base_ = it_.CurrentCellBase();
         current_cell_ = *it_.CurrentCell();
+      } else {
+        second_bit_index = 1u << (trailing_zeros + 1);
       }
 
       Map* map = nullptr;

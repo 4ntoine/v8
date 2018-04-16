@@ -16,8 +16,10 @@
 #include "src/trap-handler/trap-handler.h"
 #include "src/v8memory.h"
 #include "src/wasm/module-compiler.h"
+#include "src/wasm/wasm-code-manager.h"
+#include "src/wasm/wasm-constants.h"
+#include "src/wasm/wasm-engine.h"
 #include "src/wasm/wasm-objects.h"
-#include "src/wasm/wasm-opcodes.h"
 
 namespace v8 {
 namespace internal {
@@ -29,24 +31,29 @@ WasmInstanceObject* GetWasmInstanceOnStackTop(Isolate* isolate) {
   const Address entry = Isolate::c_entry_fp(isolate->thread_local_top());
   Address pc =
       Memory::Address_at(entry + StandardFrameConstants::kCallerPCOffset);
-  Code* code = isolate->inner_pointer_to_code_cache()->GetCacheEntry(pc)->code;
-  DCHECK_EQ(Code::WASM_FUNCTION, code->kind());
-  WasmInstanceObject* owning_instance =
-      WasmInstanceObject::GetOwningInstance(code);
+  WasmInstanceObject* owning_instance = nullptr;
+  if (FLAG_wasm_jit_to_native) {
+    owning_instance = WasmInstanceObject::GetOwningInstance(
+        isolate->wasm_engine()->code_manager()->LookupCode(pc));
+  } else {
+    owning_instance = WasmInstanceObject::GetOwningInstanceGC(
+        isolate->inner_pointer_to_code_cache()->GetCacheEntry(pc)->code);
+  }
   CHECK_NOT_NULL(owning_instance);
   return owning_instance;
 }
+
 Context* GetWasmContextOnStackTop(Isolate* isolate) {
   return GetWasmInstanceOnStackTop(isolate)
       ->compiled_module()
-      ->ptr_to_native_context();
+      ->native_context();
 }
 
 class ClearThreadInWasmScope {
  public:
   explicit ClearThreadInWasmScope(bool coming_from_wasm)
       : coming_from_wasm_(coming_from_wasm) {
-    DCHECK_EQ(trap_handler::UseTrapHandler() && coming_from_wasm,
+    DCHECK_EQ(trap_handler::IsTrapHandlerEnabled() && coming_from_wasm,
               trap_handler::IsThreadInWasm());
     if (coming_from_wasm) trap_handler::ClearThreadInWasm();
   }
@@ -73,74 +80,23 @@ RUNTIME_FUNCTION(Runtime_WasmGrowMemory) {
 
   // Set the current isolate's context.
   DCHECK_NULL(isolate->context());
-  isolate->set_context(instance->compiled_module()->ptr_to_native_context());
+  isolate->set_context(instance->compiled_module()->native_context());
 
   return *isolate->factory()->NewNumberFromInt(
       WasmInstanceObject::GrowMemory(isolate, instance, delta_pages));
 }
 
-Object* ThrowRuntimeError(Isolate* isolate, int message_id, int byte_offset,
-                          bool patch_source_position) {
+RUNTIME_FUNCTION(Runtime_ThrowWasmError) {
+  DCHECK_EQ(1, args.length());
+  CONVERT_SMI_ARG_CHECKED(message_id, 0);
+  ClearThreadInWasmScope clear_wasm_flag(isolate->context() == nullptr);
+
   HandleScope scope(isolate);
   DCHECK_NULL(isolate->context());
   isolate->set_context(GetWasmContextOnStackTop(isolate));
   Handle<Object> error_obj = isolate->factory()->NewWasmRuntimeError(
       static_cast<MessageTemplate::Template>(message_id));
-
-  if (!patch_source_position) {
-    return isolate->Throw(*error_obj);
-  }
-
-  // For wasm traps, the byte offset (a.k.a source position) can not be
-  // determined from relocation info, since the explicit checks for traps
-  // converge in one singe block which calls this runtime function.
-  // We hence pass the byte offset explicitely, and patch it into the top-most
-  // frame (a wasm frame) on the collected stack trace.
-  // TODO(wasm): This implementation is temporary, see bug #5007:
-  // https://bugs.chromium.org/p/v8/issues/detail?id=5007
-  Handle<JSObject> error = Handle<JSObject>::cast(error_obj);
-  Handle<Object> stack_trace_obj = JSReceiver::GetDataProperty(
-      error, isolate->factory()->stack_trace_symbol());
-  // Patch the stack trace (array of <receiver, function, code, position>).
-  if (stack_trace_obj->IsJSArray()) {
-    Handle<FrameArray> stack_elements(
-        FrameArray::cast(JSArray::cast(*stack_trace_obj)->elements()));
-    DCHECK(stack_elements->Code(0)->kind() == AbstractCode::WASM_FUNCTION);
-    DCHECK_LE(0, stack_elements->Offset(0)->value());
-    stack_elements->SetOffset(0, Smi::FromInt(-1 - byte_offset));
-  }
-
-  // Patch the detailed stack trace (array of JSObjects with various
-  // properties).
-  Handle<Object> detailed_stack_trace_obj = JSReceiver::GetDataProperty(
-      error, isolate->factory()->detailed_stack_trace_symbol());
-  if (detailed_stack_trace_obj->IsFixedArray()) {
-    Handle<FixedArray> stack_elements(
-        FixedArray::cast(*detailed_stack_trace_obj));
-    DCHECK_GE(stack_elements->length(), 1);
-    Handle<StackFrameInfo> top_frame(
-        StackFrameInfo::cast(stack_elements->get(0)));
-    if (top_frame->column_number()) {
-      top_frame->set_column_number(byte_offset + 1);
-    }
-  }
-
   return isolate->Throw(*error_obj);
-}
-
-RUNTIME_FUNCTION(Runtime_ThrowWasmErrorFromTrapIf) {
-  DCHECK_EQ(1, args.length());
-  CONVERT_SMI_ARG_CHECKED(message_id, 0);
-  ClearThreadInWasmScope clear_wasm_flag(isolate->context() == nullptr);
-  return ThrowRuntimeError(isolate, message_id, 0, false);
-}
-
-RUNTIME_FUNCTION(Runtime_ThrowWasmError) {
-  DCHECK_EQ(2, args.length());
-  CONVERT_SMI_ARG_CHECKED(message_id, 0);
-  CONVERT_SMI_ARG_CHECKED(byte_offset, 1);
-  ClearThreadInWasmScope clear_wasm_flag(isolate->context() == nullptr);
-  return ThrowRuntimeError(isolate, message_id, byte_offset, true);
 }
 
 RUNTIME_FUNCTION(Runtime_ThrowWasmStackOverflow) {
@@ -215,7 +171,7 @@ RUNTIME_FUNCTION(Runtime_WasmGetExceptionRuntimeId) {
       }
     }
   }
-  return Smi::FromInt(wasm::WasmModule::kInvalidExceptionTag);
+  return Smi::FromInt(wasm::kInvalidExceptionTag);
 }
 
 RUNTIME_FUNCTION(Runtime_WasmExceptionGetElement) {
@@ -276,11 +232,11 @@ RUNTIME_FUNCTION(Runtime_WasmExceptionSetElement) {
 }
 
 RUNTIME_FUNCTION(Runtime_WasmRunInterpreter) {
-  DCHECK_EQ(3, args.length());
+  DCHECK_EQ(2, args.length());
   HandleScope scope(isolate);
-  CONVERT_ARG_HANDLE_CHECKED(WasmInstanceObject, instance, 0);
-  CONVERT_NUMBER_CHECKED(int32_t, func_index, Int32, args[1]);
-  CONVERT_ARG_HANDLE_CHECKED(Object, arg_buffer_obj, 2);
+  CONVERT_NUMBER_CHECKED(int32_t, func_index, Int32, args[0]);
+  CONVERT_ARG_HANDLE_CHECKED(Object, arg_buffer_obj, 1);
+  Handle<WasmInstanceObject> instance(GetWasmInstanceOnStackTop(isolate));
 
   // The arg buffer is the raw pointer to the caller's stack. It looks like a
   // Smi (lowest bit not set, as checked by IsSmi), but is no valid Smi. We just
@@ -293,7 +249,7 @@ RUNTIME_FUNCTION(Runtime_WasmRunInterpreter) {
 
   // Set the current isolate's context.
   DCHECK_NULL(isolate->context());
-  isolate->set_context(instance->compiled_module()->ptr_to_native_context());
+  isolate->set_context(instance->compiled_module()->native_context());
 
   // Find the frame pointer of the interpreter entry.
   Address frame_pointer = 0;
@@ -320,7 +276,8 @@ RUNTIME_FUNCTION(Runtime_WasmRunInterpreter) {
 RUNTIME_FUNCTION(Runtime_WasmStackGuard) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(0, args.length());
-  DCHECK(!trap_handler::UseTrapHandler() || trap_handler::IsThreadInWasm());
+  DCHECK(!trap_handler::IsTrapHandlerEnabled() ||
+         trap_handler::IsThreadInWasm());
 
   ClearThreadInWasmScope wasm_flag(true);
 
@@ -339,7 +296,15 @@ RUNTIME_FUNCTION(Runtime_WasmCompileLazy) {
   DCHECK_EQ(0, args.length());
   HandleScope scope(isolate);
 
-  return *wasm::CompileLazy(isolate);
+  if (FLAG_wasm_jit_to_native) {
+    Address new_func = wasm::CompileLazy(isolate);
+    // The alternative to this is having 2 lazy compile builtins. The builtins
+    // are part of the snapshot, so the flag has no impact on the codegen there.
+    return reinterpret_cast<Object*>(new_func - Code::kHeaderSize +
+                                     kHeapObjectTag);
+  } else {
+    return *wasm::CompileLazyOnGCHeap(isolate);
+  }
 }
 
 }  // namespace internal

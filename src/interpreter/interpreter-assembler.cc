@@ -577,7 +577,7 @@ void InterpreterAssembler::CallEpilogue() {
     Node* stack_pointer_before_call = stack_pointer_before_call_;
     stack_pointer_before_call_ = nullptr;
     AbortIfWordNotEqual(stack_pointer_before_call, stack_pointer_after_call,
-                        kUnexpectedStackPointer);
+                        AbortReason::kUnexpectedStackPointer);
   }
 }
 
@@ -586,7 +586,11 @@ void InterpreterAssembler::IncrementCallCount(Node* feedback_vector,
   Comment("increment call count");
   Node* call_count =
       LoadFeedbackVectorSlot(feedback_vector, slot_id, kPointerSize);
-  Node* new_count = SmiAdd(call_count, SmiConstant(1));
+  // The lowest {CallICNexus::CallCountField::kShift} bits of the call
+  // count are used as flags. To increment the call count by 1 we hence
+  // have to increment by 1 << {CallICNexus::CallCountField::kShift}.
+  Node* new_count =
+      SmiAdd(call_count, SmiConstant(1 << CallICNexus::CallCountField::kShift));
   // Count is Smi, so we don't need a write barrier.
   StoreFeedbackVectorSlot(feedback_vector, slot_id, new_count,
                           SKIP_WRITE_BARRIER, kPointerSize);
@@ -634,45 +638,42 @@ void InterpreterAssembler::CollectCallableFeedback(Node* target, Node* context,
       GotoIf(TaggedIsSmi(target), &mark_megamorphic);
       // Check if the {target} is a JSFunction or JSBoundFunction
       // in the current native context.
-      VARIABLE(var_target, MachineRepresentation::kTagged, target);
-      Label loop(this, &var_target), done_loop(this);
+      VARIABLE(var_current, MachineRepresentation::kTagged, target);
+      Label loop(this, &var_current), done_loop(this);
       Goto(&loop);
       BIND(&loop);
       {
         Label if_boundfunction(this), if_function(this);
-        Node* target = var_target.value();
-        CSA_ASSERT(this, TaggedIsNotSmi(target));
-        Node* target_instance_type = LoadInstanceType(target);
-        GotoIf(InstanceTypeEqual(target_instance_type, JS_BOUND_FUNCTION_TYPE),
+        Node* current = var_current.value();
+        CSA_ASSERT(this, TaggedIsNotSmi(current));
+        Node* current_instance_type = LoadInstanceType(current);
+        GotoIf(InstanceTypeEqual(current_instance_type, JS_BOUND_FUNCTION_TYPE),
                &if_boundfunction);
-        Branch(InstanceTypeEqual(target_instance_type, JS_FUNCTION_TYPE),
+        Branch(InstanceTypeEqual(current_instance_type, JS_FUNCTION_TYPE),
                &if_function, &mark_megamorphic);
 
         BIND(&if_function);
         {
-          // Check that the JSFunction {target} is in the current native
+          // Check that the JSFunction {current} is in the current native
           // context.
-          Node* target_context =
-              LoadObjectField(target, JSFunction::kContextOffset);
-          Node* target_native_context = LoadNativeContext(target_context);
-          Branch(WordEqual(LoadNativeContext(context), target_native_context),
+          Node* current_context =
+              LoadObjectField(current, JSFunction::kContextOffset);
+          Node* current_native_context = LoadNativeContext(current_context);
+          Branch(WordEqual(LoadNativeContext(context), current_native_context),
                  &done_loop, &mark_megamorphic);
         }
 
         BIND(&if_boundfunction);
         {
           // Continue with the [[BoundTargetFunction]] of {target}.
-          var_target.Bind(LoadObjectField(
-              target, JSBoundFunction::kBoundTargetFunctionOffset));
+          var_current.Bind(LoadObjectField(
+              current, JSBoundFunction::kBoundTargetFunctionOffset));
           Goto(&loop);
         }
       }
       BIND(&done_loop);
-      CreateWeakCellInFeedbackVector(feedback_vector, SmiTag(slot_id), target);
-      // Reset profiler ticks.
-      StoreObjectFieldNoWriteBarrier(feedback_vector,
-                                     FeedbackVector::kProfilerTicksOffset,
-                                     SmiConstant(0));
+      CreateWeakCellInFeedbackVector(feedback_vector, slot_id, target);
+      ReportFeedbackUpdate(feedback_vector, slot_id, "Call:Initialize");
       Goto(&done);
     }
 
@@ -686,10 +687,8 @@ void InterpreterAssembler::CollectCallableFeedback(Node* target, Node* context,
           feedback_vector, slot_id,
           HeapConstant(FeedbackVector::MegamorphicSentinel(isolate())),
           SKIP_WRITE_BARRIER);
-      // Reset profiler ticks.
-      StoreObjectFieldNoWriteBarrier(feedback_vector,
-                                     FeedbackVector::kProfilerTicksOffset,
-                                     SmiConstant(0));
+      ReportFeedbackUpdate(feedback_vector, slot_id,
+                           "Call:TransitionMegamorphic");
       Goto(&done);
     }
   }
@@ -847,24 +846,50 @@ Node* InterpreterAssembler::Construct(Node* target, Node* context,
 
     BIND(&initialize);
     {
-      // Check if {new_target} is a JSFunction in the current native context.
-      Label create_allocation_site(this), create_weak_cell(this);
       Comment("check if function in same native context");
       GotoIf(TaggedIsSmi(new_target), &mark_megamorphic);
-      // TODO(bmeurer): Add support for arbitrary constructors here, and
-      // check via GetFunctionRealm (see src/objects.cc).
-      GotoIfNot(IsJSFunction(new_target), &mark_megamorphic);
-      Node* new_target_context =
-          LoadObjectField(new_target, JSFunction::kContextOffset);
-      Node* new_target_native_context = LoadNativeContext(new_target_context);
-      GotoIfNot(
-          WordEqual(LoadNativeContext(context), new_target_native_context),
-          &mark_megamorphic);
+      // Check if the {new_target} is a JSFunction or JSBoundFunction
+      // in the current native context.
+      VARIABLE(var_current, MachineRepresentation::kTagged, new_target);
+      Label loop(this, &var_current), done_loop(this);
+      Goto(&loop);
+      BIND(&loop);
+      {
+        Label if_boundfunction(this), if_function(this);
+        Node* current = var_current.value();
+        CSA_ASSERT(this, TaggedIsNotSmi(current));
+        Node* current_instance_type = LoadInstanceType(current);
+        GotoIf(InstanceTypeEqual(current_instance_type, JS_BOUND_FUNCTION_TYPE),
+               &if_boundfunction);
+        Branch(InstanceTypeEqual(current_instance_type, JS_FUNCTION_TYPE),
+               &if_function, &mark_megamorphic);
+
+        BIND(&if_function);
+        {
+          // Check that the JSFunction {current} is in the current native
+          // context.
+          Node* current_context =
+              LoadObjectField(current, JSFunction::kContextOffset);
+          Node* current_native_context = LoadNativeContext(current_context);
+          Branch(WordEqual(LoadNativeContext(context), current_native_context),
+                 &done_loop, &mark_megamorphic);
+        }
+
+        BIND(&if_boundfunction);
+        {
+          // Continue with the [[BoundTargetFunction]] of {current}.
+          var_current.Bind(LoadObjectField(
+              current, JSBoundFunction::kBoundTargetFunctionOffset));
+          Goto(&loop);
+        }
+      }
+      BIND(&done_loop);
 
       // Create an AllocationSite if {target} and {new_target} refer
       // to the current native context's Array constructor.
+      Label create_allocation_site(this), create_weak_cell(this);
       GotoIfNot(WordEqual(target, new_target), &create_weak_cell);
-      Node* array_function = LoadContextElement(new_target_native_context,
+      Node* array_function = LoadContextElement(LoadNativeContext(context),
                                                 Context::ARRAY_FUNCTION_INDEX);
       Branch(WordEqual(target, array_function), &create_allocation_site,
              &create_weak_cell);
@@ -873,21 +898,16 @@ Node* InterpreterAssembler::Construct(Node* target, Node* context,
       {
         var_site.Bind(CreateAllocationSiteInFeedbackVector(feedback_vector,
                                                            SmiTag(slot_id)));
-        // Reset profiler ticks.
-        StoreObjectFieldNoWriteBarrier(feedback_vector,
-                                       FeedbackVector::kProfilerTicksOffset,
-                                       SmiConstant(0));
+        ReportFeedbackUpdate(feedback_vector, slot_id,
+                             "Construct:CreateAllocationSite");
         Goto(&construct_array);
       }
 
       BIND(&create_weak_cell);
       {
-        CreateWeakCellInFeedbackVector(feedback_vector, SmiTag(slot_id),
-                                       new_target);
-        // Reset profiler ticks.
-        StoreObjectFieldNoWriteBarrier(feedback_vector,
-                                       FeedbackVector::kProfilerTicksOffset,
-                                       SmiConstant(0));
+        CreateWeakCellInFeedbackVector(feedback_vector, slot_id, new_target);
+        ReportFeedbackUpdate(feedback_vector, slot_id,
+                             "Construct:CreateWeakCell");
         Goto(&construct);
       }
     }
@@ -902,10 +922,8 @@ Node* InterpreterAssembler::Construct(Node* target, Node* context,
           feedback_vector, slot_id,
           HeapConstant(FeedbackVector::MegamorphicSentinel(isolate())),
           SKIP_WRITE_BARRIER);
-      // Reset profiler ticks.
-      StoreObjectFieldNoWriteBarrier(feedback_vector,
-                                     FeedbackVector::kProfilerTicksOffset,
-                                     SmiConstant(0));
+      ReportFeedbackUpdate(feedback_vector, slot_id,
+                           "Construct:TransitionMegamorphic");
       Goto(&construct);
     }
   }
@@ -992,25 +1010,47 @@ Node* InterpreterAssembler::ConstructWithSpread(Node* target, Node* context,
 
     BIND(&initialize);
     {
-      // Check if {new_target} is a JSFunction in the current native
-      // context.
       Comment("check if function in same native context");
       GotoIf(TaggedIsSmi(new_target), &mark_megamorphic);
-      // TODO(bmeurer): Add support for arbitrary constructors here, and
-      // check via GetFunctionRealm (see src/objects.cc).
-      GotoIfNot(IsJSFunction(new_target), &mark_megamorphic);
-      Node* target_context =
-          LoadObjectField(new_target, JSFunction::kContextOffset);
-      Node* target_native_context = LoadNativeContext(target_context);
-      GotoIfNot(WordEqual(LoadNativeContext(context), target_native_context),
-                &mark_megamorphic);
+      // Check if the {new_target} is a JSFunction or JSBoundFunction
+      // in the current native context.
+      VARIABLE(var_current, MachineRepresentation::kTagged, new_target);
+      Label loop(this, &var_current), done_loop(this);
+      Goto(&loop);
+      BIND(&loop);
+      {
+        Label if_boundfunction(this), if_function(this);
+        Node* current = var_current.value();
+        CSA_ASSERT(this, TaggedIsNotSmi(current));
+        Node* current_instance_type = LoadInstanceType(current);
+        GotoIf(InstanceTypeEqual(current_instance_type, JS_BOUND_FUNCTION_TYPE),
+               &if_boundfunction);
+        Branch(InstanceTypeEqual(current_instance_type, JS_FUNCTION_TYPE),
+               &if_function, &mark_megamorphic);
 
-      CreateWeakCellInFeedbackVector(feedback_vector, SmiTag(slot_id),
-                                     new_target);
-      // Reset profiler ticks.
-      StoreObjectFieldNoWriteBarrier(feedback_vector,
-                                     FeedbackVector::kProfilerTicksOffset,
-                                     SmiConstant(0));
+        BIND(&if_function);
+        {
+          // Check that the JSFunction {current} is in the current native
+          // context.
+          Node* current_context =
+              LoadObjectField(current, JSFunction::kContextOffset);
+          Node* current_native_context = LoadNativeContext(current_context);
+          Branch(WordEqual(LoadNativeContext(context), current_native_context),
+                 &done_loop, &mark_megamorphic);
+        }
+
+        BIND(&if_boundfunction);
+        {
+          // Continue with the [[BoundTargetFunction]] of {current}.
+          var_current.Bind(LoadObjectField(
+              current, JSBoundFunction::kBoundTargetFunctionOffset));
+          Goto(&loop);
+        }
+      }
+      BIND(&done_loop);
+      CreateWeakCellInFeedbackVector(feedback_vector, slot_id, new_target);
+      ReportFeedbackUpdate(feedback_vector, slot_id,
+                           "ConstructWithSpread:Initialize");
       Goto(&construct);
     }
 
@@ -1024,10 +1064,8 @@ Node* InterpreterAssembler::ConstructWithSpread(Node* target, Node* context,
           feedback_vector, slot_id,
           HeapConstant(FeedbackVector::MegamorphicSentinel(isolate())),
           SKIP_WRITE_BARRIER);
-      // Reset profiler ticks.
-      StoreObjectFieldNoWriteBarrier(feedback_vector,
-                                     FeedbackVector::kProfilerTicksOffset,
-                                     SmiConstant(0));
+      ReportFeedbackUpdate(feedback_vector, slot_id,
+                           "ConstructWithSpread:TransitionMegamorphic");
       Goto(&construct);
     }
   }
@@ -1275,7 +1313,6 @@ void InterpreterAssembler::DispatchWide(OperandScale operand_scale) {
       break;
     default:
       UNREACHABLE();
-      base_index = nullptr;
   }
   Node* target_index = IntPtrAdd(base_index, next_bytecode);
   Node* target_code_entry =
@@ -1310,34 +1347,26 @@ void InterpreterAssembler::UpdateInterruptBudgetOnReturn() {
   UpdateInterruptBudget(profiling_weight, true);
 }
 
-Node* InterpreterAssembler::StackCheckTriggeredInterrupt() {
-  Node* sp = LoadStackPointer();
-  Node* stack_limit = Load(
-      MachineType::Pointer(),
-      ExternalConstant(ExternalReference::address_of_stack_limit(isolate())));
-  return UintPtrLessThan(sp, stack_limit);
-}
-
 Node* InterpreterAssembler::LoadOSRNestingLevel() {
   return LoadObjectField(BytecodeArrayTaggedPointer(),
                          BytecodeArray::kOSRNestingLevelOffset,
                          MachineType::Int8());
 }
 
-void InterpreterAssembler::Abort(BailoutReason bailout_reason) {
+void InterpreterAssembler::Abort(AbortReason abort_reason) {
   disable_stack_check_across_call_ = true;
-  Node* abort_id = SmiConstant(bailout_reason);
+  Node* abort_id = SmiConstant(abort_reason);
   CallRuntime(Runtime::kAbort, GetContext(), abort_id);
   disable_stack_check_across_call_ = false;
 }
 
 void InterpreterAssembler::AbortIfWordNotEqual(Node* lhs, Node* rhs,
-                                               BailoutReason bailout_reason) {
+                                               AbortReason abort_reason) {
   Label ok(this), abort(this, Label::kDeferred);
   Branch(WordEqual(lhs, rhs), &ok, &abort);
 
   BIND(&abort);
-  Abort(bailout_reason);
+  Abort(abort_reason);
   Goto(&ok);
 
   BIND(&ok);
@@ -1357,7 +1386,7 @@ void InterpreterAssembler::MaybeDropFrames(Node* context) {
   // We don't expect this call to return since the frame dropper tears down
   // the stack and jumps into the function on the target frame to restart it.
   CallStub(CodeFactory::FrameDropperTrampoline(isolate()), context, restart_fp);
-  Abort(kUnexpectedReturnFromFrameDropper);
+  Abort(AbortReason::kUnexpectedReturnFromFrameDropper);
   Goto(&ok);
 
   BIND(&ok);
@@ -1416,7 +1445,7 @@ void InterpreterAssembler::AbortIfRegisterCountInvalid(Node* register_file,
   Branch(UintPtrLessThanOrEqual(register_count, array_size), &ok, &abort);
 
   BIND(&abort);
-  Abort(kInvalidRegisterFileInGenerator);
+  Abort(AbortReason::kInvalidRegisterFileInGenerator);
   Goto(&ok);
 
   BIND(&ok);
@@ -1548,6 +1577,18 @@ void InterpreterAssembler::ToNumberOrNumeric(Object::Conversion mode) {
 
   SetAccumulator(var_result.value());
   Dispatch();
+}
+
+void InterpreterAssembler::DeserializeLazyAndDispatch() {
+  Node* context = GetContext();
+  Node* bytecode_offset = BytecodeOffset();
+  Node* bytecode = LoadBytecode(bytecode_offset);
+
+  Node* target_handler =
+      CallRuntime(Runtime::kInterpreterDeserializeLazy, context,
+                  SmiTag(bytecode), SmiConstant(operand_scale()));
+
+  DispatchToBytecodeHandler(target_handler, bytecode_offset);
 }
 
 }  // namespace interpreter

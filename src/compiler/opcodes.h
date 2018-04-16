@@ -79,6 +79,8 @@
 #define COMMON_OP_LIST(V) \
   CONSTANT_OP_LIST(V)     \
   INNER_OP_LIST(V)        \
+  V(Unreachable)          \
+  V(DeadValue)            \
   V(Dead)
 
 // Opcodes for JavaScript operators.
@@ -103,7 +105,8 @@
   V(JSSubtract)                \
   V(JSMultiply)                \
   V(JSDivide)                  \
-  V(JSModulus)
+  V(JSModulus)                 \
+  V(JSExponentiate)
 
 #define JS_SIMPLE_BINOP_LIST(V) \
   JS_COMPARE_BINOP_LIST(V)      \
@@ -118,24 +121,34 @@
   V(JSToLength)                    \
   V(JSToName)                      \
   V(JSToNumber)                    \
+  V(JSToNumeric)                   \
   V(JSToObject)                    \
   V(JSToString)
 
-#define JS_SIMPLE_UNOP_LIST(V) JS_CONVERSION_UNOP_LIST(V)
+#define JS_SIMPLE_UNOP_LIST(V) \
+  JS_CONVERSION_UNOP_LIST(V)   \
+  V(JSBitwiseNot)              \
+  V(JSDecrement)               \
+  V(JSIncrement)               \
+  V(JSNegate)
+
+#define JS_CREATE_OP_LIST(V)    \
+  V(JSCreate)                   \
+  V(JSCreateArguments)          \
+  V(JSCreateArray)              \
+  V(JSCreateBoundFunction)      \
+  V(JSCreateClosure)            \
+  V(JSCreateGeneratorObject)    \
+  V(JSCreateIterResultObject)   \
+  V(JSCreateKeyValueArray)      \
+  V(JSCreateLiteralArray)       \
+  V(JSCreateEmptyLiteralArray)  \
+  V(JSCreateLiteralObject)      \
+  V(JSCreateEmptyLiteralObject) \
+  V(JSCreateLiteralRegExp)
 
 #define JS_OBJECT_OP_LIST(V)      \
-  V(JSCreate)                     \
-  V(JSCreateArguments)            \
-  V(JSCreateArray)                \
-  V(JSCreateBoundFunction)        \
-  V(JSCreateClosure)              \
-  V(JSCreateIterResultObject)     \
-  V(JSCreateKeyValueArray)        \
-  V(JSCreateLiteralArray)         \
-  V(JSCreateEmptyLiteralArray)    \
-  V(JSCreateLiteralObject)        \
-  V(JSCreateEmptyLiteralObject)   \
-  V(JSCreateLiteralRegExp)        \
+  JS_CREATE_OP_LIST(V)            \
   V(JSLoadProperty)               \
   V(JSLoadNamed)                  \
   V(JSLoadGlobal)                 \
@@ -146,7 +159,6 @@
   V(JSStoreDataPropertyInLiteral) \
   V(JSDeleteProperty)             \
   V(JSHasProperty)                \
-  V(JSCreateGeneratorObject)      \
   V(JSGetSuperConstructor)
 
 #define JS_CONTEXT_OP_LIST(V) \
@@ -155,31 +167,33 @@
   V(JSCreateFunctionContext)  \
   V(JSCreateCatchContext)     \
   V(JSCreateWithContext)      \
-  V(JSCreateBlockContext)     \
-  V(JSCreateScriptContext)
+  V(JSCreateBlockContext)
 
-#define JS_OTHER_OP_LIST(V)         \
-  V(JSConstructForwardVarargs)      \
-  V(JSConstruct)                    \
-  V(JSConstructWithArrayLike)       \
-  V(JSConstructWithSpread)          \
-  V(JSCallForwardVarargs)           \
-  V(JSCall)                         \
-  V(JSCallWithArrayLike)            \
-  V(JSCallWithSpread)               \
-  V(JSCallRuntime)                  \
-  V(JSConvertReceiver)              \
-  V(JSForInEnumerate)               \
-  V(JSForInNext)                    \
-  V(JSForInPrepare)                 \
-  V(JSLoadMessage)                  \
-  V(JSStoreMessage)                 \
-  V(JSLoadModule)                   \
-  V(JSStoreModule)                  \
-  V(JSGeneratorStore)               \
-  V(JSGeneratorRestoreContinuation) \
-  V(JSGeneratorRestoreRegister)     \
-  V(JSStackCheck)                   \
+#define JS_CONSTRUCT_OP_LIST(V) \
+  V(JSConstructForwardVarargs)  \
+  V(JSConstruct)                \
+  V(JSConstructWithArrayLike)   \
+  V(JSConstructWithSpread)
+
+#define JS_OTHER_OP_LIST(V)            \
+  JS_CONSTRUCT_OP_LIST(V)              \
+  V(JSCallForwardVarargs)              \
+  V(JSCall)                            \
+  V(JSCallWithArrayLike)               \
+  V(JSCallWithSpread)                  \
+  V(JSCallRuntime)                     \
+  V(JSForInEnumerate)                  \
+  V(JSForInNext)                       \
+  V(JSForInPrepare)                    \
+  V(JSLoadMessage)                     \
+  V(JSStoreMessage)                    \
+  V(JSLoadModule)                      \
+  V(JSStoreModule)                     \
+  V(JSGeneratorStore)                  \
+  V(JSGeneratorRestoreContinuation)    \
+  V(JSGeneratorRestoreRegister)        \
+  V(JSGeneratorRestoreInputOrDebugPos) \
+  V(JSStackCheck)                      \
   V(JSDebugger)
 
 #define JS_OP_LIST(V)     \
@@ -235,6 +249,7 @@
   V(SpeculativeNumberLessThan)           \
   V(SpeculativeNumberLessThanOrEqual)    \
   V(ReferenceEqual)                      \
+  V(SameValue)                           \
   V(StringEqual)                         \
   V(StringLessThan)                      \
   V(StringLessThanOrEqual)
@@ -303,6 +318,7 @@
   V(NumberTrunc)                       \
   V(NumberToBoolean)                   \
   V(NumberToInt32)                     \
+  V(NumberToString)                    \
   V(NumberToUint32)                    \
   V(NumberToUint8Clamped)              \
   V(NumberSilenceNaN)
@@ -318,9 +334,12 @@
   V(StringCharAt)                       \
   V(StringCharCodeAt)                   \
   V(SeqStringCharCodeAt)                \
+  V(StringCodePointAt)                  \
+  V(SeqStringCodePointAt)               \
   V(StringFromCharCode)                 \
   V(StringFromCodePoint)                \
   V(StringIndexOf)                      \
+  V(StringLength)                       \
   V(StringToLowerCaseIntl)              \
   V(StringToUpperCaseIntl)              \
   V(CheckBounds)                        \
@@ -339,10 +358,12 @@
   V(CheckEqualsInternalizedString)      \
   V(CheckEqualsSymbol)                  \
   V(CompareMaps)                        \
+  V(ConvertReceiver)                    \
   V(ConvertTaggedHoleToUndefined)       \
   V(TypeOf)                             \
   V(ClassOf)                            \
   V(Allocate)                           \
+  V(AllocateRaw)                        \
   V(LoadFieldByIndex)                   \
   V(LoadField)                          \
   V(LoadElement)                        \
@@ -355,7 +376,9 @@
   V(TransitionAndStoreNumberElement)    \
   V(TransitionAndStoreNonNumberElement) \
   V(ToBoolean)                          \
+  V(NumberIsFloat64Hole)                \
   V(ObjectIsArrayBufferView)            \
+  V(ObjectIsBigInt)                     \
   V(ObjectIsCallable)                   \
   V(ObjectIsConstructor)                \
   V(ObjectIsDetectableCallable)         \
@@ -373,12 +396,14 @@
   V(NewDoubleElements)                  \
   V(NewSmiOrObjectElements)             \
   V(NewArgumentsElements)               \
+  V(NewConsString)                      \
   V(ArrayBufferWasNeutered)             \
   V(EnsureWritableFastElements)         \
   V(MaybeGrowFastElements)              \
   V(TransitionElementsKind)             \
   V(FindOrderedHashMapEntry)            \
   V(FindOrderedHashMapEntryForInt32Key) \
+  V(MaskIndexWithBound)                 \
   V(RuntimeAbort)
 
 #define SIMPLIFIED_OP_LIST(V)                 \
@@ -575,8 +600,6 @@
   V(LoadStackPointer)           \
   V(LoadFramePointer)           \
   V(LoadParentFramePointer)     \
-  V(CheckedLoad)                \
-  V(CheckedStore)               \
   V(UnalignedLoad)              \
   V(UnalignedStore)             \
   V(Int32PairAdd)               \
@@ -596,6 +619,7 @@
   V(AtomicAnd)                  \
   V(AtomicOr)                   \
   V(AtomicXor)                  \
+  V(SpeculationFence)           \
   V(UnsafePointerAdd)
 
 #define MACHINE_SIMD_OP_LIST(V) \
@@ -817,7 +841,7 @@ class V8_EXPORT_PRIVATE IrOpcode {
   }
 
   static bool IsContextChainExtendingOpcode(Value value) {
-    return kJSCreateFunctionContext <= value && value <= kJSCreateScriptContext;
+    return kJSCreateFunctionContext <= value && value <= kJSCreateBlockContext;
   }
 };
 

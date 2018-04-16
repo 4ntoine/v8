@@ -21,14 +21,11 @@ namespace v8 {
 namespace internal {
 namespace wasm {
 
-#if DEBUG
 #define TRACE(...)                                    \
   do {                                                \
     if (FLAG_trace_wasm_decoder) PrintF(__VA_ARGS__); \
   } while (false)
-#else
-#define TRACE(...)
-#endif
+
 namespace {
 
 constexpr char kNameString[] = "name";
@@ -38,6 +35,20 @@ constexpr char kUnknownString[] = "<unknown>";
 template <size_t N>
 constexpr size_t num_chars(const char (&)[N]) {
   return N - 1;  // remove null character at end.
+}
+
+const char* ExternalKindName(ImportExportKindCode kind) {
+  switch (kind) {
+    case kExternalFunction:
+      return "function";
+    case kExternalTable:
+      return "table";
+    case kExternalMemory:
+      return "memory";
+    case kExternalGlobal:
+      return "global";
+  }
+  return "unknown";
 }
 
 }  // namespace
@@ -228,7 +239,6 @@ class WasmSectionIterator {
     section_code_ = decoder_.failed() ? kUnknownSectionCode
                                       : static_cast<SectionCode>(section_code);
 
-    TRACE("Section: %s\n", SectionName(section_code_));
     if (section_code_ == kUnknownSectionCode && section_end_ > decoder_.pc()) {
       // skip to the end of the unknown section.
       uint32_t remaining = static_cast<uint32_t>(section_end_ - decoder_.pc());
@@ -300,7 +310,7 @@ class ModuleDecoderImpl : public Decoder {
 
     const byte* pos = pc_;
     uint32_t magic_word = consume_u32("wasm magic");
-#define BYTES(x) (x & 0xff), (x >> 8) & 0xff, (x >> 16) & 0xff, (x >> 24) & 0xff
+#define BYTES(x) (x & 0xFF), (x >> 8) & 0xFF, (x >> 16) & 0xFF, (x >> 24) & 0xFF
     if (magic_word != kWasmMagic) {
       errorf(pos,
              "expected magic word %02x %02x %02x %02x, "
@@ -447,7 +457,8 @@ class ModuleDecoderImpl : public Decoder {
       const byte* pos = pc_;
       import->module_name = consume_string(true, "module name");
       import->field_name = consume_string(true, "field name");
-      import->kind = static_cast<WasmExternalKind>(consume_u8("import kind"));
+      import->kind =
+          static_cast<ImportExportKindCode>(consume_u8("import kind"));
       switch (import->kind) {
         case kExternalFunction: {
           // ===== Imported function =======================================
@@ -473,7 +484,7 @@ class ModuleDecoderImpl : public Decoder {
           module_->function_tables.emplace_back();
           WasmIndirectFunctionTable* table = &module_->function_tables.back();
           table->imported = true;
-          expect_u8("element type", kWasmAnyFunctionTypeForm);
+          expect_u8("element type", kWasmAnyFunctionTypeCode);
           consume_resizable_limits(
               "element count", "elements", FLAG_wasm_max_table_size,
               &table->initial_size, &table->has_maximum_size,
@@ -539,7 +550,7 @@ class ModuleDecoderImpl : public Decoder {
       if (!AddTable(module_.get())) break;
       module_->function_tables.emplace_back();
       WasmIndirectFunctionTable* table = &module_->function_tables.back();
-      expect_u8("table type", kWasmAnyFunctionTypeForm);
+      expect_u8("table type", kWasmAnyFunctionTypeCode);
       consume_resizable_limits("table elements", "elements",
                                FLAG_wasm_max_table_size, &table->initial_size,
                                &table->has_maximum_size,
@@ -592,7 +603,7 @@ class ModuleDecoderImpl : public Decoder {
       exp->name = consume_string(true, "field name");
 
       const byte* pos = pc();
-      exp->kind = static_cast<WasmExternalKind>(consume_u8("export kind"));
+      exp->kind = static_cast<ImportExportKindCode>(consume_u8("export kind"));
       switch (exp->kind) {
         case kExternalFunction: {
           WasmFunction* func = nullptr;
@@ -738,10 +749,6 @@ class ModuleDecoderImpl : public Decoder {
 
   void DecodeFunctionBody(uint32_t index, uint32_t length, uint32_t offset,
                           bool verify_functions) {
-    auto size_histogram = module_->is_wasm()
-                              ? GetCounters()->wasm_wasm_function_size_bytes()
-                              : GetCounters()->wasm_asm_function_size_bytes();
-    size_histogram->AddSample(length);
     WasmFunction* function =
         &module_->functions[index + module_->num_imported_functions];
     function->code = {offset, length};
@@ -789,12 +796,12 @@ class ModuleDecoderImpl : public Decoder {
       // Decode function names, ignore the rest.
       // Local names will be decoded when needed.
       switch (name_type) {
-        case NameSectionType::kModule: {
+        case NameSectionKindCode::kModule: {
           WireBytesRef name = wasm::consume_string(inner, false, "module name");
           if (inner.ok() && validate_utf8(&inner, name)) module_->name = name;
           break;
         }
-        case NameSectionType::kFunction: {
+        case NameSectionKindCode::kFunction: {
           uint32_t functions_count = inner.consume_u32v("functions count");
 
           for (; inner.ok() && functions_count > 0; --functions_count) {
@@ -1123,7 +1130,7 @@ class ModuleDecoderImpl : public Decoder {
 
     if (FLAG_experimental_wasm_threads) {
       bool is_memory = (strcmp(name, "memory") == 0);
-      if (flags & 0xfc || (!is_memory && (flags & 0xfe))) {
+      if (flags & 0xFC || (!is_memory && (flags & 0xFE))) {
         errorf(pos - 1, "invalid %s limits flags", name);
       }
       if (flags == 3) {
@@ -1135,7 +1142,7 @@ class ModuleDecoderImpl : public Decoder {
                name);
       }
     } else {
-      if (flags & 0xfe) {
+      if (flags & 0xFE) {
         errorf(pos - 1, "invalid %s limits flags", name);
       }
     }
@@ -1297,7 +1304,7 @@ class ModuleDecoderImpl : public Decoder {
 
  private:
   FunctionSig* consume_sig_internal(Zone* zone, bool has_return_values) {
-    if (has_return_values && !expect_u8("type form", kWasmFunctionTypeForm))
+    if (has_return_values && !expect_u8("type form", kWasmFunctionTypeCode))
       return nullptr;
     // parse parameter types
     uint32_t param_count =
@@ -1549,8 +1556,13 @@ std::vector<CustomSectionOffset> DecodeCustomSections(const byte* start,
     uint32_t name_offset = decoder.pc_offset();
     decoder.consume_bytes(name_length, "section name");
     uint32_t payload_offset = decoder.pc_offset();
+    if (section_length < (payload_offset - section_start)) {
+      decoder.error("invalid section length");
+      break;
+    }
     uint32_t payload_length = section_length - (payload_offset - section_start);
     decoder.consume_bytes(payload_length);
+    if (decoder.failed()) break;
     result.push_back({{section_start, section_length},
                       {name_offset, name_length},
                       {payload_offset, payload_length}});
@@ -1586,7 +1598,7 @@ void DecodeLocalNames(const byte* module_start, const byte* module_end,
     uint32_t name_payload_len = decoder.consume_u32v("name payload length");
     if (!decoder.checkAvailable(name_payload_len)) break;
 
-    if (name_type != NameSectionType::kLocal) {
+    if (name_type != NameSectionKindCode::kLocal) {
       decoder.consume_bytes(name_payload_len, "name subsection payload");
       continue;
     }

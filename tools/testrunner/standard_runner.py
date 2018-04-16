@@ -24,8 +24,16 @@ from testrunner.local import testsuite
 from testrunner.local import utils
 from testrunner.local import verbose
 from testrunner.local.variants import ALL_VARIANTS
-from testrunner.network import network_execution
 from testrunner.objects import context
+from testrunner.objects import predictable
+from testrunner.testproc.execution import ExecutionProc
+from testrunner.testproc.filter import StatusFileFilterProc, NameFilterProc
+from testrunner.testproc.loader import LoadProc
+from testrunner.testproc.progress import (VerboseProgressIndicator,
+                                          ResultsTracker,
+                                          TestsCounter)
+from testrunner.testproc.rerun import RerunProc
+from testrunner.testproc.variant import VariantProc
 
 
 TIMEOUT_DEFAULT = 60
@@ -37,20 +45,19 @@ MORE_VARIANTS = [
   "stress",
   "stress_incremental_marking",
   "nooptimization",
-  "stress_asm_wasm",
+  "stress_background_compile",
   "wasm_traps",
 ]
-
-EXHAUSTIVE_VARIANTS = MORE_VARIANTS + VARIANTS
 
 VARIANT_ALIASES = {
   # The default for developer workstations.
   "dev": VARIANTS,
   # Additional variants, run on all bots.
   "more": MORE_VARIANTS,
-  # TODO(machenbach): Deprecate this after the step is removed on infra side.
+  # Shortcut for the two above ("more" first - it has the longer running tests).
+  "exhaustive": MORE_VARIANTS + VARIANTS,
   # Additional variants, run on a subset of bots.
-  "extra": [],
+  "extra": ["future", "liftoff", "trusted"],
 }
 
 GC_STRESS_FLAGS = ["--gc-interval=500", "--stress-compaction",
@@ -68,18 +75,20 @@ SLOW_ARCHS = ["arm",
               "s390x",
               "arm64"]
 
+PREDICTABLE_WRAPPER = os.path.join(
+    base_runner.BASE_DIR, 'tools', 'predictable_wrapper.py')
+
 
 class StandardTestRunner(base_runner.BaseTestRunner):
-    def __init__(self):
-        super(StandardTestRunner, self).__init__()
+    def __init__(self, *args, **kwargs):
+        super(StandardTestRunner, self).__init__(*args, **kwargs)
 
-    def _do_execute(self, options, args):
-      # Use the v8 root as cwd as some test cases use "load" with relative
-      # paths.
-      os.chdir(base_runner.BASE_DIR)
+        self.sancov_dir = None
 
-      self._setup_env(options)
+    def _get_default_suite_names(self):
+      return ['default']
 
+    def _do_execute(self, suites, args, options):
       if options.swarming:
         # Swarming doesn't print how isolated commands are called. Lets make
         # this less cryptic by printing it ourselves.
@@ -95,42 +104,7 @@ class StandardTestRunner(base_runner.BaseTestRunner):
           except Exception:
             pass
 
-      suite_paths = utils.GetSuitePaths(join(base_runner.BASE_DIR, "test"))
-
-      # Use default tests if no test configuration was provided at the cmd line.
-      if len(args) == 0:
-        args = ["default"]
-
-      # Expand arguments with grouped tests. The args should reflect the list
-      # of suites as otherwise filters would break.
-      def ExpandTestGroups(name):
-        if name in base_runner.TEST_MAP:
-          return [suite for suite in base_runner.TEST_MAP[name]]
-        else:
-          return [name]
-      args = reduce(lambda x, y: x + y,
-            [ExpandTestGroups(arg) for arg in args],
-            [])
-
-      args_suites = OrderedDict() # Used as set
-      for arg in args:
-        args_suites[arg.split('/')[0]] = True
-      suite_paths = [ s for s in args_suites if s in suite_paths ]
-
-      suites = []
-      for root in suite_paths:
-        suite = testsuite.TestSuite.LoadTestSuite(
-            os.path.join(base_runner.BASE_DIR, "test", root))
-        if suite:
-          suites.append(suite)
-
-      for s in suites:
-        s.PrepareSources()
-
-      try:
-        return self._execute(args, options, suites)
-      except KeyboardInterrupt:
-        return 2
+      return self._execute(args, options, suites)
 
     def _add_parser_options(self, parser):
       parser.add_option("--sancov-dir",
@@ -160,6 +134,8 @@ class StandardTestRunner(base_runner.BaseTestRunner):
       parser.add_option("--extra-flags",
                         help="Additional flags to pass to each test command",
                         action="append", default=[])
+      parser.add_option("--infra-staging", help="Use new test runner features",
+                        default=False, action="store_true")
       parser.add_option("--isolates", help="Whether to test isolates",
                         default=False, action="store_true")
       parser.add_option("-j", help="The number of parallel tasks to run",
@@ -167,11 +143,6 @@ class StandardTestRunner(base_runner.BaseTestRunner):
       parser.add_option("--no-harness", "--noharness",
                         help="Run without test harness of a given suite",
                         default=False, action="store_true")
-      parser.add_option("--network", help="Distribute tests on the network",
-                        default=False, dest="network", action="store_true")
-      parser.add_option("--no-network", "--nonetwork",
-                        help="Don't distribute tests on the network",
-                        dest="network", action="store_false")
       parser.add_option("--no-presubmit", "--nopresubmit",
                         help='Skip presubmit checks (deprecated)',
                         default=False, dest="no_presubmit", action="store_true")
@@ -180,15 +151,16 @@ class StandardTestRunner(base_runner.BaseTestRunner):
                         " run.",
                         default=False, dest="no_sorting", action="store_true")
       parser.add_option("--no-variants", "--novariants",
-                        help="Don't run any testing variants",
+                        help="Deprecated. "
+                             "Equivalent to passing --variants=default",
                         default=False, dest="no_variants", action="store_true")
       parser.add_option("--variants",
                         help="Comma-separated list of testing variants;"
                         " default: \"%s\"" % ",".join(VARIANTS))
       parser.add_option("--exhaustive-variants",
                         default=False, action="store_true",
-                        help="Use exhaustive set of default variants:"
-                        " \"%s\"" % ",".join(EXHAUSTIVE_VARIANTS))
+                        help="Deprecated. "
+                             "Equivalent to passing --variants=exhaustive")
       parser.add_option("-p", "--progress",
                         help=("The style of progress indicator"
                               " (verbose, dots, color, mono)"),
@@ -210,12 +182,6 @@ class StandardTestRunner(base_runner.BaseTestRunner):
       parser.add_option("--rerun-failures-max",
                         help="Maximum number of failing test cases to rerun.",
                         default=100, type="int")
-      parser.add_option("--shard-count",
-                        help="Split testsuites into this number of shards",
-                        default=1, type="int")
-      parser.add_option("--shard-run",
-                        help="Run this shard from the split up tests.",
-                        default=1, type="int")
       parser.add_option("--dont-skip-slow-simulator-tests",
                         help="Don't skip more slow tests when using a"
                         " simulator.",
@@ -228,10 +194,6 @@ class StandardTestRunner(base_runner.BaseTestRunner):
                         default=False, action="store_true")
       parser.add_option("-t", "--timeout", help="Timeout in seconds",
                         default=TIMEOUT_DEFAULT, type="int")
-      parser.add_option("-v", "--verbose", help="Verbose output",
-                        default=False, action="store_true")
-      parser.add_option("--valgrind", help="Run tests through valgrind",
-                        default=False, action="store_true")
       parser.add_option("--warn-unused", help="Report unused rules",
                         default=False, action="store_true")
       parser.add_option("--junitout", help="File name of the JUnit output")
@@ -248,14 +210,12 @@ class StandardTestRunner(base_runner.BaseTestRunner):
     def _process_options(self, options):
       global VARIANTS
 
-      # Special processing of other options, sorted alphabetically.
+      if options.sancov_dir:
+        self.sancov_dir = options.sancov_dir
+        if not os.path.exists(self.sancov_dir):
+          print("sancov-dir %s doesn't exist" % self.sancov_dir)
+          raise base_runner.TestRunnerError()
 
-      if options.buildbot:
-        options.network = False
-      if options.command_prefix and options.network:
-        print("Specifying --command-prefix disables network distribution, "
-              "running tests locally.")
-        options.network = False
       options.command_prefix = shlex.split(options.command_prefix)
       options.extra_flags = sum(map(shlex.split, options.extra_flags), [])
 
@@ -269,16 +229,41 @@ class StandardTestRunner(base_runner.BaseTestRunner):
       if options.novfp3:
         options.extra_flags.append("--noenable-vfp3")
 
-      if options.exhaustive_variants:
+      if options.no_variants:  # pragma: no cover
+        print ("Option --no-variants is deprecated. "
+               "Pass --variants=default instead.")
+        assert not options.variants
+        options.variants = "default"
+
+      if options.exhaustive_variants:  # pragma: no cover
+        # TODO(machenbach): Switch infra to --variants=exhaustive after M65.
+        print ("Option --exhaustive-variants is deprecated. "
+               "Pass --variants=exhaustive instead.")
         # This is used on many bots. It includes a larger set of default
         # variants.
         # Other options for manipulating variants still apply afterwards.
-        VARIANTS = EXHAUSTIVE_VARIANTS
+        assert not options.variants
+        options.variants = "exhaustive"
+
+      if options.quickcheck:
+        assert not options.variants
+        options.variants = "stress,default"
+        options.slow_tests = "skip"
+        options.pass_fail_tests = "skip"
+
+      if self.build_config.predictable:
+        options.variants = "default"
+        options.extra_flags.append("--predictable")
+        options.extra_flags.append("--verify_predictable")
+        options.extra_flags.append("--no-inline-new")
+        # Add predictable wrapper to command prefix.
+        options.command_prefix = (
+            [sys.executable, PREDICTABLE_WRAPPER] + options.command_prefix)
 
       # TODO(machenbach): Figure out how to test a bigger subset of variants on
       # msan.
       if self.build_config.msan:
-        VARIANTS = ["default"]
+        options.variants = "default"
 
       if options.j == 0:
         options.j = multiprocessing.cpu_count()
@@ -286,48 +271,27 @@ class StandardTestRunner(base_runner.BaseTestRunner):
       if options.random_seed_stress_count <= 1 and options.random_seed == 0:
         options.random_seed = self._random_seed()
 
-      def excl(*args):
-        """Returns true if zero or one of multiple arguments are true."""
-        return reduce(lambda x, y: x + y, args) <= 1
+      # Use developer defaults if no variant was specified.
+      options.variants = options.variants or "dev"
 
-      if not excl(options.no_variants, bool(options.variants)):
-        print("Use only one of --no-variants or --variants.")
+      if options.variants == "infra_staging":
+        options.variants = "exhaustive"
+        options.infra_staging = True
+
+      # Resolve variant aliases and dedupe.
+      # TODO(machenbach): Don't mutate global variable. Rather pass mutated
+      # version as local variable.
+      VARIANTS = list(set(reduce(
+          list.__add__,
+          (VARIANT_ALIASES.get(v, [v]) for v in options.variants.split(",")),
+          [],
+      )))
+
+      if not set(VARIANTS).issubset(ALL_VARIANTS):
+        print "All variants must be in %s" % str(ALL_VARIANTS)
         raise base_runner.TestRunnerError()
-      if options.quickcheck:
-        VARIANTS = ["default", "stress"]
-        options.slow_tests = "skip"
-        options.pass_fail_tests = "skip"
-      if options.no_variants:
-        VARIANTS = ["default"]
-      if options.variants:
-        VARIANTS = options.variants.split(",")
 
-        # Resolve variant aliases.
-        VARIANTS = reduce(
-            list.__add__,
-            (VARIANT_ALIASES.get(v, [v]) for v in VARIANTS),
-            [],
-        )
-
-        if not set(VARIANTS).issubset(ALL_VARIANTS):
-          print "All variants must be in %s" % str(ALL_VARIANTS)
-          raise base_runner.TestRunnerError()
-      if self.build_config.predictable:
-        VARIANTS = ["default"]
-        options.extra_flags.append("--predictable")
-        options.extra_flags.append("--verify_predictable")
-        options.extra_flags.append("--no-inline-new")
-
-      # Dedupe.
-      VARIANTS = list(set(VARIANTS))
-
-      if options.valgrind:
-        run_valgrind = os.path.join("tools", "run-valgrind.py")
-        # This is OK for distributed running, so we don't need to disable
-        # network.
-        options.command_prefix = (["python", "-u", run_valgrind] +
-                                  options.command_prefix)
-      def CheckTestMode(name, option):
+      def CheckTestMode(name, option):  # pragma: no cover
         if not option in ["run", "skip", "dontcare"]:
           print "Unknown %s mode %s" % (name, option)
           raise base_runner.TestRunnerError()
@@ -336,72 +300,20 @@ class StandardTestRunner(base_runner.BaseTestRunner):
       if self.build_config.no_i18n:
         base_runner.TEST_MAP["bot_default"].remove("intl")
         base_runner.TEST_MAP["default"].remove("intl")
+        # TODO(machenbach): uncomment after infra side lands.
+        # base_runner.TEST_MAP["d8_default"].remove("intl")
 
-    def _setup_env(self, options):
-      """Setup additional environment variables."""
+    def _setup_env(self):
+      super(StandardTestRunner, self)._setup_env()
 
-      # Many tests assume an English interface.
-      os.environ['LANG'] = 'en_US.UTF-8'
+      symbolizer_option = self._get_external_symbolizer_option()
 
-      external_symbolizer_path = os.path.join(
-          base_runner.BASE_DIR,
-          'third_party',
-          'llvm-build',
-          'Release+Asserts',
-          'bin',
-          'llvm-symbolizer',
-      )
-      if utils.IsWindows():
-        # Quote, because sanitizers might confuse colon as option separator.
-        external_symbolizer_path = '"%s.exe"' % external_symbolizer_path
-      symbolizer = 'external_symbolizer_path=%s' % external_symbolizer_path
-
-      if self.build_config.asan:
-        asan_options = [symbolizer, "allow_user_segv_handler=1"]
-        if not utils.GuessOS() in ['macos', 'windows']:
-          # LSAN is not available on mac and windows.
-          asan_options.append('detect_leaks=1')
-        os.environ['ASAN_OPTIONS'] = ":".join(asan_options)
-
-      if options.sancov_dir:
-        assert os.path.exists(options.sancov_dir)
+      if self.sancov_dir:
         os.environ['ASAN_OPTIONS'] = ":".join([
           'coverage=1',
-          'coverage_dir=%s' % options.sancov_dir,
-          symbolizer,
+          'coverage_dir=%s' % self.sancov_dir,
+          symbolizer_option,
           "allow_user_segv_handler=1",
-        ])
-
-      if self.build_config.cfi_vptr:
-        os.environ['UBSAN_OPTIONS'] = ":".join([
-          'print_stacktrace=1',
-          'print_summary=1',
-          'symbolize=1',
-          symbolizer,
-        ])
-
-      if self.build_config.ubsan_vptr:
-        os.environ['UBSAN_OPTIONS'] = ":".join([
-          'print_stacktrace=1',
-          symbolizer,
-        ])
-
-      if self.build_config.msan:
-        os.environ['MSAN_OPTIONS'] = symbolizer
-
-      if self.build_config.tsan:
-        suppressions_file = os.path.join(
-            base_runner.BASE_DIR,
-            'tools',
-            'sanitizers',
-            'tsan_suppressions.txt')
-        os.environ['TSAN_OPTIONS'] = " ".join([
-          symbolizer,
-          'suppressions=%s' % suppressions_file,
-          'exit_code=0',
-          'report_thread_leaks=0',
-          'history_size=7',
-          'report_destroy_locked=0',
         ])
 
     def _random_seed(self):
@@ -412,27 +324,23 @@ class StandardTestRunner(base_runner.BaseTestRunner):
 
     def _execute(self, args, options, suites):
       print(">>> Running tests for %s.%s" % (self.build_config.arch,
-                                             self.build_config.mode))
-
-      mode_options = base_runner.MODES[self.build_config.mode]
-
+                                             self.mode_name))
       # Populate context object.
-      mode_flags = mode_options["flags"]
 
       # Simulators are slow, therefore allow a longer timeout.
       if self.build_config.arch in SLOW_ARCHS:
         options.timeout *= 2
 
-      options.timeout *= mode_options["timeout_scalefactor"]
+      options.timeout *= self.mode_options.timeout_scalefactor
 
       if self.build_config.predictable:
         # Predictable mode is slower.
         options.timeout *= 2
 
       ctx = context.Context(self.build_config.arch,
-                            mode_options["execution_mode"],
-                            self.shell_dir,
-                            mode_flags,
+                            self.mode_options.execution_mode,
+                            self.outdir,
+                            self.mode_options.flags,
                             options.verbose,
                             options.timeout,
                             options.isolates,
@@ -443,10 +351,10 @@ class StandardTestRunner(base_runner.BaseTestRunner):
                             options.no_sorting,
                             options.rerun_failures_count,
                             options.rerun_failures_max,
-                            self.build_config.predictable,
                             options.no_harness,
                             use_perf_data=not options.swarming,
-                            sancov_dir=options.sancov_dir)
+                            sancov_dir=self.sancov_dir,
+                            infra_staging=options.infra_staging)
 
       # TODO(all): Combine "simulator" and "simulator_run".
       # TODO(machenbach): In GN we can derive simulator run from
@@ -465,10 +373,11 @@ class StandardTestRunner(base_runner.BaseTestRunner):
         "byteorder": sys.byteorder,
         "dcheck_always_on": self.build_config.dcheck_always_on,
         "deopt_fuzzer": False,
+        "gc_fuzzer": False,
         "gc_stress": options.gc_stress,
         "gcov_coverage": self.build_config.gcov_coverage,
         "isolates": options.isolates,
-        "mode": mode_options["status_mode"],
+        "mode": self.mode_options.status_mode,
         "msan": self.build_config.msan,
         "no_harness": options.no_harness,
         "no_i18n": self.build_config.no_i18n,
@@ -481,6 +390,31 @@ class StandardTestRunner(base_runner.BaseTestRunner):
         "tsan": self.build_config.tsan,
         "ubsan_vptr": self.build_config.ubsan_vptr,
       }
+
+      progress_indicator = progress.IndicatorNotifier()
+      progress_indicator.Register(
+        progress.PROGRESS_INDICATORS[options.progress]())
+      if options.junitout:  # pragma: no cover
+        progress_indicator.Register(progress.JUnitTestProgressIndicator(
+            options.junitout, options.junittestsuite))
+      if options.json_test_results:
+        progress_indicator.Register(progress.JsonTestProgressIndicator(
+          options.json_test_results,
+          self.build_config.arch,
+          self.mode_options.execution_mode,
+          ctx.random_seed))
+      if options.flakiness_results:  # pragma: no cover
+        progress_indicator.Register(progress.FlakinessTestProgressIndicator(
+            options.flakiness_results))
+
+      if options.infra_staging:
+        for s in suites:
+          s.ReadStatusFile(variables)
+          s.ReadTestCases(ctx)
+
+        return self._run_test_procs(suites, args, options, progress_indicator,
+                                    ctx)
+
       all_tests = []
       num_tests = 0
       for s in suites:
@@ -490,16 +424,18 @@ class StandardTestRunner(base_runner.BaseTestRunner):
           s.FilterTestCasesByArgs(args)
         all_tests += s.tests
 
-        # First filtering by status applying the generic rules (independent of
-        # variants).
-        s.FilterTestCasesByStatus(options.warn_unused, options.slow_tests,
-                                  options.pass_fail_tests)
+        # First filtering by status applying the generic rules (tests without
+        # variants)
+        if options.warn_unused:
+          tests = [(t.name, t.variant) for t in s.tests]
+          s.statusfile.warn_unused_rules(tests, check_variant_rules=False)
+        s.FilterTestCasesByStatus(options.slow_tests, options.pass_fail_tests)
 
         if options.cat:
           verbose.PrintTestSource(s.tests)
           continue
-        variant_gen = s.CreateVariantGenerator(VARIANTS)
-        variant_tests = [ t.CopyAddingFlags(v, flags)
+        variant_gen = s.CreateLegacyVariantsGenerator(VARIANTS)
+        variant_tests = [ t.create_variant(v, flags)
                           for t in s.tests
                           for v in variant_gen.FilterVariantsByTest(t)
                           for flags in variant_gen.GetFlagSets(t, v) ]
@@ -515,18 +451,24 @@ class StandardTestRunner(base_runner.BaseTestRunner):
               else:
                 yield ["--random-seed=%d" % self._random_seed()]
           s.tests = [
-            t.CopyAddingFlags(t.variant, flags)
+            t.create_variant(t.variant, flags, 'seed-stress-%d' % n)
             for t in variant_tests
-            for flags in iter_seed_flags()
+            for n, flags in enumerate(iter_seed_flags())
           ]
         else:
           s.tests = variant_tests
 
-        # Second filtering by status applying the variant-dependent rules.
-        s.FilterTestCasesByStatus(options.warn_unused, options.slow_tests,
-                                  options.pass_fail_tests, variants=True)
+        # Second filtering by status applying also the variant-dependent rules.
+        if options.warn_unused:
+          tests = [(t.name, t.variant) for t in s.tests]
+          s.statusfile.warn_unused_rules(tests, check_variant_rules=True)
 
+        s.FilterTestCasesByStatus(options.slow_tests, options.pass_fail_tests)
         s.tests = self._shard_tests(s.tests, options)
+
+        for t in s.tests:
+          t.cmd = t.get_command(ctx)
+
         num_tests += len(s.tests)
 
       if options.cat:
@@ -535,55 +477,21 @@ class StandardTestRunner(base_runner.BaseTestRunner):
       if options.report:
         verbose.PrintReport(all_tests)
 
-      # Run the tests, either locally or distributed on the network.
+      # Run the tests.
       start_time = time.time()
-      progress_indicator = progress.IndicatorNotifier()
-      progress_indicator.Register(
-        progress.PROGRESS_INDICATORS[options.progress]())
-      if options.junitout:
-        progress_indicator.Register(progress.JUnitTestProgressIndicator(
-            options.junitout, options.junittestsuite))
-      if options.json_test_results:
-        progress_indicator.Register(progress.JsonTestProgressIndicator(
-          options.json_test_results,
-          self.build_config.arch,
-          mode_options["execution_mode"],
-          ctx.random_seed))
-      if options.flakiness_results:
-        progress_indicator.Register(progress.FlakinessTestProgressIndicator(
-            options.flakiness_results))
 
-      run_networked = options.network
-      if not run_networked:
-        if options.verbose:
-          print("Network distribution disabled, running tests locally.")
-      elif utils.GuessOS() != "linux":
-        print("Network distribution is only supported on Linux, sorry!")
-        run_networked = False
-      peers = []
-      if run_networked:
-        peers = network_execution.GetPeers()
-        if not peers:
-          print("No connection to distribution server; running tests locally.")
-          run_networked = False
-        elif len(peers) == 1:
-          print("No other peers on the network; running tests locally.")
-          run_networked = False
-        elif num_tests <= 100:
-          print("Less than 100 tests, running them locally.")
-          run_networked = False
-
-      if run_networked:
-        runner = network_execution.NetworkedRunner(
-          suites, progress_indicator, ctx, peers, base_runner.BASE_DIR)
+      if self.build_config.predictable:
+        outproc_factory = predictable.get_outproc
       else:
-        runner = execution.Runner(suites, progress_indicator, ctx)
+        outproc_factory = None
 
+      runner = execution.Runner(suites, progress_indicator, ctx,
+                                outproc_factory)
       exit_code = runner.Run(options.j)
       overall_duration = time.time() - start_time
 
       if options.time:
-        verbose.PrintTestDurations(suites, overall_duration)
+        verbose.PrintTestDurations(suites, runner.outputs, overall_duration)
 
       if num_tests == 0:
         print("Warning: no tests were run!")
@@ -593,15 +501,14 @@ class StandardTestRunner(base_runner.BaseTestRunner):
               "generated with failure information.")
         exit_code = 0
 
-      if options.sancov_dir:
+      if self.sancov_dir:
         # If tests ran with sanitizer coverage, merge coverage files in the end.
         try:
           print "Merging sancov files."
           subprocess.check_call([
             sys.executable,
-            join(
-              base_runner.BASE_DIR, "tools", "sanitizers", "sancov_merger.py"),
-            "--coverage-dir=%s" % options.sancov_dir])
+            join(self.basedir, "tools", "sanitizers", "sancov_merger.py"),
+            "--coverage-dir=%s" % self.sancov_dir])
         except:
           print >> sys.stderr, "Error: Merging sancov files failed."
           exit_code = 1
@@ -609,32 +516,9 @@ class StandardTestRunner(base_runner.BaseTestRunner):
       return exit_code
 
     def _shard_tests(self, tests, options):
-      # Read gtest shard configuration from environment (e.g. set by swarming).
-      # If none is present, use values passed on the command line.
-      shard_count = int(
-        os.environ.get('GTEST_TOTAL_SHARDS', options.shard_count))
-      shard_run = os.environ.get('GTEST_SHARD_INDEX')
-      if shard_run is not None:
-        # The v8 shard_run starts at 1, while GTEST_SHARD_INDEX starts at 0.
-        shard_run = int(shard_run) + 1
-      else:
-        shard_run = options.shard_run
-
-      if options.shard_count > 1:
-        # Log if a value was passed on the cmd line and it differs from the
-        # environment variables.
-        if options.shard_count != shard_count:
-          print("shard_count from cmd line differs from environment variable "
-                "GTEST_TOTAL_SHARDS")
-        if options.shard_run > 1 and options.shard_run != shard_run:
-          print("shard_run from cmd line differs from environment variable "
-                "GTEST_SHARD_INDEX")
+      shard_run, shard_count = self._get_shard_info(options)
 
       if shard_count < 2:
-        return tests
-      if shard_run < 1 or shard_run > shard_count:
-        print "shard-run not a valid number, should be in [1:shard-count]"
-        print "defaulting back to running all tests"
         return tests
       count = 0
       shard = []
@@ -643,6 +527,72 @@ class StandardTestRunner(base_runner.BaseTestRunner):
           shard.append(test)
         count += 1
       return shard
+
+    def _run_test_procs(self, suites, args, options, progress_indicator,
+                        context):
+      jobs = options.j
+
+      print '>>> Running with test processors'
+      loader = LoadProc()
+      tests_counter = TestsCounter()
+      results = ResultsTracker()
+      indicators = progress_indicator.ToProgressIndicatorProcs()
+      execproc = ExecutionProc(jobs, context)
+
+      procs = [
+        loader,
+        NameFilterProc(args) if args else None,
+        StatusFileFilterProc(options.slow_tests, options.pass_fail_tests),
+        self._create_shard_proc(options),
+        tests_counter,
+        VariantProc(VARIANTS),
+        StatusFileFilterProc(options.slow_tests, options.pass_fail_tests),
+      ] + indicators + [
+        results,
+        self._create_rerun_proc(context),
+        execproc,
+      ]
+
+      procs = filter(None, procs)
+
+      for i in xrange(0, len(procs) - 1):
+        procs[i].connect_to(procs[i + 1])
+
+      tests = [t for s in suites for t in s.tests]
+      tests.sort(key=lambda t: t.is_slow, reverse=True)
+
+      loader.setup()
+      loader.load_tests(tests)
+
+      print '>>> Running %d base tests' % tests_counter.total
+      tests_counter.remove_from_chain()
+
+      execproc.start()
+
+      for indicator in indicators:
+        indicator.finished()
+
+      print '>>> %d tests ran' % results.total
+
+      exit_code = 0
+      if results.failed:
+        exit_code = 1
+      if results.remaining:
+        exit_code = 2
+
+
+      if exit_code == 1 and options.json_test_results:
+        print("Force exit code 0 after failures. Json test results file "
+              "generated with failure information.")
+        exit_code = 0
+      return exit_code
+
+    def _create_rerun_proc(self, ctx):
+      if not ctx.rerun_failures_count:
+        return None
+      return RerunProc(ctx.rerun_failures_count,
+                       ctx.rerun_failures_max)
+
 
 
 if __name__ == '__main__':

@@ -196,7 +196,6 @@ class V8_EXPORT_PRIVATE Scope : public NON_EXPORTED_BASE(ZoneObject) {
 
   Variable* DeclareVariable(Declaration* declaration, VariableMode mode,
                             InitializationFlag init,
-                            bool allow_harmony_restrictive_generators,
                             bool* sloppy_mode_block_scope_function_redefinition,
                             bool* ok);
 
@@ -335,14 +334,6 @@ class V8_EXPORT_PRIVATE Scope : public NON_EXPORTED_BASE(ZoneObject) {
   bool is_hidden() const { return is_hidden_; }
   void set_is_hidden() { is_hidden_ = true; }
 
-  // In some cases we want to force context allocation for a whole scope.
-  void ForceContextAllocation() {
-    DCHECK(!already_resolved_);
-    force_context_allocation_ = true;
-  }
-  bool has_forced_context_allocation() const {
-    return force_context_allocation_;
-  }
   void ForceContextAllocationForParameters() {
     DCHECK(!already_resolved_);
     force_context_allocation_for_parameters_ = true;
@@ -404,6 +395,8 @@ class V8_EXPORT_PRIVATE Scope : public NON_EXPORTED_BASE(ZoneObject) {
     DCHECK_EQ(1, num_var());
     return static_cast<Variable*>(variables_.Start()->value);
   }
+
+  bool ShouldBanArguments();
 
   // ---------------------------------------------------------------------------
   // Variable allocation.
@@ -705,6 +698,10 @@ class V8_EXPORT_PRIVATE DeclarationScope : public Scope {
   bool asm_module() const { return asm_module_; }
   void set_asm_module();
 
+  bool should_ban_arguments() const {
+    return IsClassFieldsInitializerFunction(function_kind());
+  }
+
   void DeclareThis(AstValueFactory* ast_value_factory);
   void DeclareArguments(AstValueFactory* ast_value_factory);
   void DeclareDefaultFunctionVariables(AstValueFactory* ast_value_factory);
@@ -763,10 +760,7 @@ class V8_EXPORT_PRIVATE DeclarationScope : public Scope {
 
   // The variable holding the function literal for named function
   // literals, or nullptr.  Only valid for function scopes.
-  Variable* function_var() const {
-    DCHECK(is_function_scope());
-    return function_;
-  }
+  Variable* function_var() const { return function_; }
 
   Variable* generator_object_var() const {
     DCHECK(is_function_scope() || is_module_scope());

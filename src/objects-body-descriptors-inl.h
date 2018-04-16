@@ -355,9 +355,10 @@ class Code::BodyDescriptor final : public BodyDescriptorBase {
   STATIC_ASSERT(kDeoptimizationDataOffset + kPointerSize ==
                 kSourcePositionTableOffset);
   STATIC_ASSERT(kSourcePositionTableOffset + kPointerSize ==
-                kTypeFeedbackInfoOffset);
-  STATIC_ASSERT(kTypeFeedbackInfoOffset + kPointerSize ==
-                kNextCodeLinkOffset);
+                kProtectedInstructionsOffset);
+  STATIC_ASSERT(kProtectedInstructionsOffset + kPointerSize ==
+                kCodeDataContainerOffset);
+  STATIC_ASSERT(kCodeDataContainerOffset + kPointerSize == kDataStart);
 
   static bool IsValidSlot(HeapObject* obj, int offset) {
     // Slots in code can't be invalid because we never trim code objects.
@@ -373,12 +374,8 @@ class Code::BodyDescriptor final : public BodyDescriptorBase {
                     RelocInfo::ModeMask(RelocInfo::INTERNAL_REFERENCE_ENCODED) |
                     RelocInfo::ModeMask(RelocInfo::RUNTIME_ENTRY);
 
-    IteratePointers(obj, kRelocationInfoOffset, kNextCodeLinkOffset, v);
-    v->VisitNextCodeLink(Code::cast(obj),
-                         HeapObject::RawField(obj, kNextCodeLinkOffset));
-
     // GC does not visit data/code in the header and in the body directly.
-    STATIC_ASSERT(Code::kNextCodeLinkOffset + kPointerSize == kDataStart);
+    IteratePointers(obj, kRelocationInfoOffset, kDataStart, v);
 
     RelocIterator it(Code::cast(obj), mode_mask);
     Isolate* isolate = obj->GetIsolate();
@@ -459,6 +456,8 @@ ReturnType BodyDescriptorApply(InstanceType type, T1 p1, T2 p2, T3 p3) {
       return ReturnType();
     case PROPERTY_ARRAY_TYPE:
       return Op::template apply<PropertyArray::BodyDescriptor>(p1, p2, p3);
+    case DESCRIPTOR_ARRAY_TYPE:
+      return Op::template apply<DescriptorArray::BodyDescriptor>(p1, p2, p3);
     case TRANSITION_ARRAY_TYPE:
       return Op::template apply<TransitionArray::BodyDescriptor>(p1, p2, p3);
     case FEEDBACK_VECTOR_TYPE:
@@ -537,6 +536,8 @@ ReturnType BodyDescriptorApply(InstanceType type, T1 p1, T2 p2, T3 p3) {
       return Op::template apply<
           SmallOrderedHashTable<SmallOrderedHashMap>::BodyDescriptor>(p1, p2,
                                                                       p3);
+    case CODE_DATA_CONTAINER_TYPE:
+      return Op::template apply<CodeDataContainer::BodyDescriptor>(p1, p2, p3);
     case HEAP_NUMBER_TYPE:
     case MUTABLE_HEAP_NUMBER_TYPE:
     case FILLER_TYPE:
@@ -563,6 +564,9 @@ ReturnType BodyDescriptorApply(InstanceType type, T1 p1, T2 p2, T3 p3) {
       } else {
         return Op::template apply<StructBodyDescriptor>(p1, p2, p3);
       }
+    case LOAD_HANDLER_TYPE:
+    case STORE_HANDLER_TYPE:
+      return Op::template apply<StructBodyDescriptor>(p1, p2, p3);
     default:
       PrintF("Unknown type: %d\n", type);
       UNREACHABLE();

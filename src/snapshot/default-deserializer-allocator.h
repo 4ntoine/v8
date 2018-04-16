@@ -44,7 +44,7 @@ class DefaultDeserializerAllocator final {
   // ------- Reservation Methods -------
   // Methods related to memory reservations (prior to deserialization).
 
-  void DecodeReservation(Vector<const SerializedData::Reservation> res);
+  void DecodeReservation(std::vector<SerializedData::Reservation> res);
   bool ReserveSpace();
 
   // Atomically reserves space for the two given deserializers. Guarantees
@@ -57,11 +57,6 @@ class DefaultDeserializerAllocator final {
   // ------- Misc Utility Methods -------
 
   void RegisterDeserializedObjectsForBlackAllocation();
-
-  // For SortMapDescriptors();
-  const std::vector<Address>& GetAllocatedMaps() const {
-    return allocated_maps_;
-  }
 
  private:
   Isolate* isolate() const;

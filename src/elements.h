@@ -54,9 +54,10 @@ class ElementsAccessor {
   // typed array elements.
   virtual bool HasEntry(JSObject* holder, uint32_t entry) = 0;
 
+  // TODO(cbruni): HasEntry and Get should not be exposed publicly with the
+  // entry parameter.
   virtual Handle<Object> Get(Handle<JSObject> holder, uint32_t entry) = 0;
 
-  virtual PropertyDetails GetDetails(JSObject* holder, uint32_t entry) = 0;
   virtual bool HasAccessors(JSObject* holder) = 0;
   virtual uint32_t NumberOfElements(JSObject* holder) = 0;
 
@@ -67,8 +68,6 @@ class ElementsAccessor {
   // element that is non-deletable.
   virtual void SetLength(Handle<JSArray> holder, uint32_t new_length) = 0;
 
-  // Deletes an element in an object.
-  virtual void Delete(Handle<JSObject> holder, uint32_t entry) = 0;
 
   // If kCopyToEnd is specified as the copy_size to CopyElements, it copies all
   // of elements from source after source_start to the destination array.
@@ -126,11 +125,6 @@ class ElementsAccessor {
 
   virtual void Set(Handle<JSObject> holder, uint32_t entry, Object* value) = 0;
 
-  virtual void Reconfigure(Handle<JSObject> object,
-                           Handle<FixedArrayBase> backing_store, uint32_t entry,
-                           Handle<Object> value,
-                           PropertyAttributes attributes) = 0;
-
   virtual void Add(Handle<JSObject> object, uint32_t index,
                    Handle<Object> value, PropertyAttributes attributes,
                    uint32_t new_capacity) = 0;
@@ -158,7 +152,7 @@ class ElementsAccessor {
 
   virtual Handle<Object> Shift(Handle<JSArray> receiver) = 0;
 
-  virtual Handle<SeededNumberDictionary> Normalize(Handle<JSObject> object) = 0;
+  virtual Handle<NumberDictionary> Normalize(Handle<JSObject> object) = 0;
 
   virtual uint32_t GetCapacity(JSObject* holder,
                                FixedArrayBase* backing_store) = 0;
@@ -214,6 +208,15 @@ class ElementsAccessor {
                                     FixedArrayBase* backing_store,
                                     uint32_t index) = 0;
 
+  virtual PropertyDetails GetDetails(JSObject* holder, uint32_t entry) = 0;
+  virtual void Reconfigure(Handle<JSObject> object,
+                           Handle<FixedArrayBase> backing_store, uint32_t entry,
+                           Handle<Object> value,
+                           PropertyAttributes attributes) = 0;
+
+  // Deletes an element in an object.
+  virtual void Delete(Handle<JSObject> holder, uint32_t entry) = 0;
+
   // NOTE: this method violates the handlified function signature convention:
   // raw pointer parameter |source_holder| in the function that allocates.
   // This is done intentionally to avoid ArrayConcat() builtin performance
@@ -236,6 +239,17 @@ void CheckArrayAbuse(Handle<JSObject> obj, const char* op, uint32_t index,
 MUST_USE_RESULT MaybeHandle<Object> ArrayConstructInitializeElements(
     Handle<JSArray> array,
     Arguments* args);
+
+// Called directly from CSA.
+class JSTypedArray;
+void CopyFastNumberJSArrayElementsToTypedArray(Context* context,
+                                               JSArray* source,
+                                               JSTypedArray* destination,
+                                               uintptr_t length,
+                                               uintptr_t offset);
+void CopyTypedArrayElementsToTypedArray(JSTypedArray* source,
+                                        JSTypedArray* destination,
+                                        uintptr_t length, uintptr_t offset);
 
 }  // namespace internal
 }  // namespace v8

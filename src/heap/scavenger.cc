@@ -9,6 +9,7 @@
 #include "src/heap/mark-compact-inl.h"
 #include "src/heap/objects-visiting-inl.h"
 #include "src/heap/scavenger-inl.h"
+#include "src/heap/sweeper.h"
 #include "src/objects-body-descriptors-inl.h"
 
 namespace v8 {
@@ -89,15 +90,14 @@ void Scavenger::IterateAndScavengePromotedObject(HeapObject* target, int size) {
 void Scavenger::AddPageToSweeperIfNecessary(MemoryChunk* page) {
   AllocationSpace space = page->owner()->identity();
   if ((space == OLD_SPACE) && !page->SweepingDone()) {
-    heap()->mark_compact_collector()->sweeper().AddPage(
+    heap()->mark_compact_collector()->sweeper()->AddPage(
         space, reinterpret_cast<Page*>(page),
-        MarkCompactCollector::Sweeper::READD_TEMPORARY_REMOVED_PAGE);
+        Sweeper::READD_TEMPORARY_REMOVED_PAGE);
   }
 }
 
 void Scavenger::ScavengePage(MemoryChunk* page) {
-  PreferredSweepingPage(page);
-
+  CodePageMemoryModificationScope memory_modification_scope(page);
   RememberedSet<OLD_TO_NEW>::Iterate(
       page,
       [this](Address addr) { return CheckAndScavengeObject(heap_, addr); },
@@ -151,20 +151,6 @@ void Scavenger::Process(OneshotBarrier* barrier) {
       }
     }
   } while (!done);
-}
-
-void Scavenger::RecordCopiedObject(HeapObject* obj) {
-  bool should_record = FLAG_log_gc;
-#ifdef DEBUG
-  should_record = FLAG_heap_stats;
-#endif
-  if (should_record) {
-    if (heap()->new_space()->Contains(obj)) {
-      heap()->new_space()->RecordAllocation(obj);
-    } else {
-      heap()->new_space()->RecordPromotion(obj);
-    }
-  }
 }
 
 void Scavenger::Finalize() {

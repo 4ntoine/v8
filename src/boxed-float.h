@@ -18,12 +18,7 @@ namespace internal {
 // the exact bit pattern during deoptimization when passing this value.
 class Float32 {
  public:
-  Float32() : bit_pattern_(0) {}
-
-  Float32(const Float32&) = default;
-
-  explicit constexpr Float32(uint32_t bit_pattern)
-      : bit_pattern_(bit_pattern) {}
+  Float32() = default;
 
   // This constructor does not guarantee that bit pattern of the input value
   // is preserved if the input is a NaN.
@@ -50,21 +45,21 @@ class Float32 {
   static constexpr Float32 FromBits(uint32_t bits) { return Float32(bits); }
 
  private:
-  uint32_t bit_pattern_;
+  uint32_t bit_pattern_ = 0;
+
+  explicit constexpr Float32(uint32_t bit_pattern)
+      : bit_pattern_(bit_pattern) {}
 };
 
 static_assert(IS_TRIVIALLY_COPYABLE(Float32),
               "Float32 should be trivially copyable");
 
 // Safety wrapper for a 64-bit floating-point value to make sure we don't lose
-// the exact bit pattern during deoptimization when passing this value. Note
-// that there is intentionally no way to construct it from a {double} value.
+// the exact bit pattern during deoptimization when passing this value.
 // TODO(ahaas): Unify this class with Double in double.h
 class Float64 {
  public:
-  Float64() : bit_pattern_(0) {}
-
-  Float64(const Float64&) = default;
+  Float64() = default;
 
   // This constructor does not guarantee that bit pattern of the input value
   // is preserved if the input is a NaN.
@@ -90,9 +85,10 @@ class Float64 {
   static constexpr Float64 FromBits(uint64_t bits) { return Float64(bits); }
 
  private:
+  uint64_t bit_pattern_ = 0;
+
   explicit constexpr Float64(uint64_t bit_pattern)
       : bit_pattern_(bit_pattern) {}
-  uint64_t bit_pattern_;
 };
 
 static_assert(IS_TRIVIALLY_COPYABLE(Float64),

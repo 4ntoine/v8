@@ -284,7 +284,7 @@ void V8Console::Clear(const v8::debug::ConsoleCallArguments& info,
 void V8Console::Count(const v8::debug::ConsoleCallArguments& info,
                       const v8::debug::ConsoleContext& consoleContext) {
   ConsoleHelper helper(info, consoleContext, m_inspector);
-  String16 title = helper.firstArgToString(String16());
+  String16 title = helper.firstArgToString(String16("default"), false);
   String16 identifier;
   if (title.isEmpty()) {
     std::unique_ptr<V8StackTraceImpl> stackTrace =
@@ -354,10 +354,16 @@ static void timeFunction(const v8::debug::ConsoleCallArguments& info,
   ConsoleHelper helper(info, consoleContext, inspector);
   String16 protocolTitle = helper.firstArgToString("default", false);
   if (timelinePrefix) protocolTitle = "Timeline '" + protocolTitle + "'";
+  const String16& timerId =
+      protocolTitle + "@" + consoleContextToString(consoleContext);
+  if (helper.consoleMessageStorage()->hasTimer(helper.contextId(), timerId)) {
+    helper.reportCallWithArgument(
+        ConsoleAPIType::kWarning,
+        "Timer '" + protocolTitle + "' already exists");
+    return;
+  }
   inspector->client()->consoleTime(toStringView(protocolTitle));
-  helper.consoleMessageStorage()->time(
-      helper.contextId(),
-      protocolTitle + "@" + consoleContextToString(consoleContext));
+  helper.consoleMessageStorage()->time(helper.contextId(), timerId);
 }
 
 static void timeEndFunction(const v8::debug::ConsoleCallArguments& info,
@@ -366,6 +372,14 @@ static void timeEndFunction(const v8::debug::ConsoleCallArguments& info,
   ConsoleHelper helper(info, consoleContext, inspector);
   String16 protocolTitle = helper.firstArgToString("default", false);
   if (timelinePrefix) protocolTitle = "Timeline '" + protocolTitle + "'";
+  const String16& timerId =
+      protocolTitle + "@" + consoleContextToString(consoleContext);
+  if (!helper.consoleMessageStorage()->hasTimer(helper.contextId(), timerId)) {
+    helper.reportCallWithArgument(
+        ConsoleAPIType::kWarning,
+        "Timer '" + protocolTitle + "' does not exist");
+    return;
+  }
   inspector->client()->consoleTimeEnd(toStringView(protocolTitle));
   double elapsed = helper.consoleMessageStorage()->timeEnd(
       helper.contextId(),
@@ -663,9 +677,10 @@ v8::Local<v8::Object> V8Console::createCommandLineAPI(
   DCHECK(success);
   USE(success);
 
-  // TODO(dgozman): this CommandLineAPIData instance leaks. Use PodArray maybe?
-  v8::Local<v8::External> data =
-      v8::External::New(isolate, new CommandLineAPIData(this, sessionId));
+  v8::Local<v8::ArrayBuffer> data =
+      v8::ArrayBuffer::New(isolate, sizeof(CommandLineAPIData));
+  *static_cast<CommandLineAPIData*>(data->GetContents().Data()) =
+      CommandLineAPIData(this, sessionId);
   createBoundFunctionProperty(context, commandLineAPI, data, "dir",
                               &V8Console::call<&V8Console::Dir>,
                               "function dir(value) { [Command Line API] }");

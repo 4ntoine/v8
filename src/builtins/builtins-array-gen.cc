@@ -31,6 +31,34 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
   typedef std::function<void(ArrayBuiltinCodeStubAssembler* masm)>
       PostLoopAction;
 
+  enum class MissingPropertyMode { kSkip, kUseUndefined };
+
+  void FindResultGenerator() { a_.Bind(UndefinedConstant()); }
+
+  Node* FindProcessor(Node* k_value, Node* k) {
+    Node* value = CallJS(CodeFactory::Call(isolate()), context(), callbackfn(),
+                         this_arg(), k_value, k, o());
+    Label false_continue(this), return_true(this);
+    BranchIfToBooleanIsTrue(value, &return_true, &false_continue);
+    BIND(&return_true);
+    ReturnFromBuiltin(k_value);
+    BIND(&false_continue);
+    return a();
+  }
+
+  void FindIndexResultGenerator() { a_.Bind(SmiConstant(-1)); }
+
+  Node* FindIndexProcessor(Node* k_value, Node* k) {
+    Node* value = CallJS(CodeFactory::Call(isolate()), context(), callbackfn(),
+                         this_arg(), k_value, k, o());
+    Label false_continue(this), return_true(this);
+    BranchIfToBooleanIsTrue(value, &return_true, &false_continue);
+    BIND(&return_true);
+    ReturnFromBuiltin(k);
+    BIND(&false_continue);
+    return a();
+  }
+
   void ForEachResultGenerator() { a_.Bind(UndefinedConstant()); }
 
   Node* ForEachProcessor(Node* k_value, Node* k) {
@@ -306,7 +334,7 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
 
     BIND(&slow);
     CallRuntime(Runtime::kSetProperty, context(), a(), k, mapped_value,
-                SmiConstant(Smi::FromEnum(LanguageMode::kStrict)));
+                SmiConstant(LanguageMode::kStrict));
     Goto(&done);
 
     BIND(&detached);
@@ -357,16 +385,14 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
       const char* name, const BuiltinResultGenerator& generator,
       const CallResultProcessor& processor, const PostLoopAction& action,
       const Callable& slow_case_continuation,
+      MissingPropertyMode missing_property_mode,
       ForEachDirection direction = ForEachDirection::kForward) {
     Label non_array(this), array_changes(this, {&k_, &a_, &to_});
 
     // TODO(danno): Seriously? Do we really need to throw the exact error
     // message on null and undefined so that the webkit tests pass?
     Label throw_null_undefined_exception(this, Label::kDeferred);
-    GotoIf(WordEqual(receiver(), NullConstant()),
-           &throw_null_undefined_exception);
-    GotoIf(WordEqual(receiver(), UndefinedConstant()),
-           &throw_null_undefined_exception);
+    GotoIf(IsNullOrUndefined(receiver()), &throw_null_undefined_exception);
 
     // By the book: taken directly from the ECMAScript 2015 specification
 
@@ -416,7 +442,8 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
 
     generator(this);
 
-    HandleFastElements(processor, action, &fully_spec_compliant_, direction);
+    HandleFastElements(processor, action, &fully_spec_compliant_, direction,
+                       missing_property_mode);
 
     BIND(&fully_spec_compliant_);
 
@@ -527,6 +554,7 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
 
   void GenerateIteratingArrayBuiltinLoopContinuation(
       const CallResultProcessor& processor, const PostLoopAction& action,
+      MissingPropertyMode missing_property_mode,
       ForEachDirection direction = ForEachDirection::kForward) {
     Label loop(this, {&k_, &a_, &to_});
     Label after_loop(this);
@@ -549,12 +577,15 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
       // index in the range [0, 2^32-1).
       CSA_ASSERT(this, IsNumberArrayIndex(k()));
 
-      // b. Let kPresent be HasProperty(O, Pk).
-      // c. ReturnIfAbrupt(kPresent).
-      Node* k_present = HasProperty(o(), k(), context(), kHasProperty);
+      if (missing_property_mode == MissingPropertyMode::kSkip) {
+        // b. Let kPresent be HasProperty(O, Pk).
+        // c. ReturnIfAbrupt(kPresent).
+        TNode<Oddball> k_present =
+            HasProperty(o(), k(), context(), kHasProperty);
 
-      // d. If kPresent is true, then
-      GotoIf(WordNotEqual(k_present, TrueConstant()), &done_element);
+        // d. If kPresent is true, then
+        GotoIf(IsFalse(k_present), &done_element);
+      }
 
       // i. Let kValue be Get(O, Pk).
       // ii. ReturnIfAbrupt(kValue).
@@ -632,7 +663,8 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
   void VisitAllFastElementsOneKind(ElementsKind kind,
                                    const CallResultProcessor& processor,
                                    Label* array_changed, ParameterMode mode,
-                                   ForEachDirection direction) {
+                                   ForEachDirection direction,
+                                   MissingPropertyMode missing_property_mode) {
     Comment("begin VisitAllFastElementsOneKind");
     VARIABLE(original_map, MachineRepresentation::kTagged);
     original_map.Bind(LoadMap(o()));
@@ -647,7 +679,8 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
         list, start, end,
         [=, &original_map](Node* index) {
           k_.Bind(ParameterToTagged(index, mode));
-          Label one_element_done(this), hole_element(this);
+          Label one_element_done(this), hole_element(this),
+              process_element(this);
 
           // Check if o's map has changed during the callback. If so, we have to
           // fall back to the slower spec implementation for the rest of the
@@ -670,24 +703,32 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
                               ? FixedArray::kHeaderSize
                               : (FixedArray::kHeaderSize - kHeapObjectTag);
           Node* offset = ElementOffsetFromIndex(index, kind, mode, base_size);
-          Node* value = nullptr;
+          VARIABLE(value, MachineRepresentation::kTagged);
           if (kind == PACKED_ELEMENTS) {
-            value = LoadObjectField(elements, offset);
-            GotoIf(WordEqual(value, TheHoleConstant()), &hole_element);
+            value.Bind(LoadObjectField(elements, offset));
+            GotoIf(WordEqual(value.value(), TheHoleConstant()), &hole_element);
           } else {
             Node* double_value =
                 LoadDoubleWithHoleCheck(elements, offset, &hole_element);
-            value = AllocateHeapNumberWithValue(double_value);
+            value.Bind(AllocateHeapNumberWithValue(double_value));
           }
-          a_.Bind(processor(this, value, k()));
-          Goto(&one_element_done);
+          Goto(&process_element);
 
           BIND(&hole_element);
-          // Check if o's prototype change unexpectedly has elements after the
-          // callback in the case of a hole.
-          BranchIfPrototypesHaveNoElements(o_map, &one_element_done,
-                                           array_changed);
-
+          if (missing_property_mode == MissingPropertyMode::kSkip) {
+            // Check if o's prototype change unexpectedly has elements after
+            // the callback in the case of a hole.
+            BranchIfPrototypesHaveNoElements(o_map, &one_element_done,
+                                             array_changed);
+          } else {
+            value.Bind(UndefinedConstant());
+            Goto(&process_element);
+          }
+          BIND(&process_element);
+          {
+            a_.Bind(processor(this, value.value(), k()));
+            Goto(&one_element_done);
+          }
           BIND(&one_element_done);
         },
         1, mode, advance_mode);
@@ -696,7 +737,8 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
 
   void HandleFastElements(const CallResultProcessor& processor,
                           const PostLoopAction& action, Label* slow,
-                          ForEachDirection direction) {
+                          ForEachDirection direction,
+                          MissingPropertyMode missing_property_mode) {
     Label switch_on_elements_kind(this), fast_elements(this),
         maybe_double_elements(this), fast_double_elements(this);
 
@@ -719,7 +761,7 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
     BIND(&fast_elements);
     {
       VisitAllFastElementsOneKind(PACKED_ELEMENTS, processor, slow, mode,
-                                  direction);
+                                  direction, missing_property_mode);
 
       action(this);
 
@@ -734,7 +776,7 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
     BIND(&fast_double_elements);
     {
       VisitAllFastElementsOneKind(PACKED_DOUBLE_ELEMENTS, processor, slow, mode,
-                                  direction);
+                                  direction, missing_property_mode);
 
       action(this);
 
@@ -856,11 +898,10 @@ class ArrayBuiltinCodeStubAssembler : public CodeStubAssembler {
   ElementsKind source_elements_kind_ = ElementsKind::NO_ELEMENTS;
 };
 
-TF_BUILTIN(FastArrayPop, CodeStubAssembler) {
+TF_BUILTIN(ArrayPrototypePop, CodeStubAssembler) {
   Node* argc = Parameter(BuiltinDescriptor::kArgumentsCount);
   Node* context = Parameter(BuiltinDescriptor::kContext);
-  CSA_ASSERT(this, WordEqual(Parameter(BuiltinDescriptor::kNewTarget),
-                             UndefinedConstant()));
+  CSA_ASSERT(this, IsUndefined(Parameter(BuiltinDescriptor::kNewTarget)));
 
   CodeStubArguments args(this, ChangeInt32ToIntPtr(argc));
   Node* receiver = args.GetReceiver();
@@ -955,7 +996,7 @@ TF_BUILTIN(FastArrayPop, CodeStubAssembler) {
   }
 }
 
-TF_BUILTIN(FastArrayPush, CodeStubAssembler) {
+TF_BUILTIN(ArrayPrototypePush, CodeStubAssembler) {
   TVARIABLE(IntPtrT, arg_index);
   Label default_label(this, &arg_index);
   Label smi_transition(this);
@@ -969,8 +1010,7 @@ TF_BUILTIN(FastArrayPush, CodeStubAssembler) {
   // arguments are reordered.
   Node* argc = Parameter(BuiltinDescriptor::kArgumentsCount);
   Node* context = Parameter(BuiltinDescriptor::kContext);
-  CSA_ASSERT(this, WordEqual(Parameter(BuiltinDescriptor::kNewTarget),
-                             UndefinedConstant()));
+  CSA_ASSERT(this, IsUndefined(Parameter(BuiltinDescriptor::kNewTarget)));
 
   CodeStubArguments args(this, ChangeInt32ToIntPtr(argc));
   Node* receiver = args.GetReceiver();
@@ -1003,7 +1043,7 @@ TF_BUILTIN(FastArrayPush, CodeStubAssembler) {
     // TODO(danno): Use the KeyedStoreGeneric stub here when possible,
     // calling into the runtime to do the elements transition is overkill.
     CallRuntime(Runtime::kSetProperty, context, receiver, length, arg,
-                SmiConstant(Smi::FromEnum(LanguageMode::kStrict)));
+                SmiConstant(LanguageMode::kStrict));
     Increment(&arg_index);
     // The runtime SetProperty call could have converted the array to dictionary
     // mode, which must be detected to abort the fast-path.
@@ -1050,7 +1090,7 @@ TF_BUILTIN(FastArrayPush, CodeStubAssembler) {
     // TODO(danno): Use the KeyedStoreGeneric stub here when possible,
     // calling into the runtime to do the elements transition is overkill.
     CallRuntime(Runtime::kSetProperty, context, receiver, length, arg,
-                SmiConstant(Smi::FromEnum(LanguageMode::kStrict)));
+                SmiConstant(LanguageMode::kStrict));
     Increment(&arg_index);
     // The runtime SetProperty call could have converted the array to dictionary
     // mode, which must be detected to abort the fast-path.
@@ -1070,7 +1110,7 @@ TF_BUILTIN(FastArrayPush, CodeStubAssembler) {
         [this, receiver, context](Node* arg) {
           Node* length = LoadJSArrayLength(receiver);
           CallRuntime(Runtime::kSetProperty, context, receiver, length, arg,
-                      SmiConstant(Smi::FromEnum(LanguageMode::kStrict)));
+                      SmiConstant(LanguageMode::kStrict));
         },
         arg_index);
     args.PopAndReturn(LoadJSArrayLength(receiver));
@@ -1085,9 +1125,10 @@ TF_BUILTIN(FastArrayPush, CodeStubAssembler) {
   }
 }
 
-class FastArraySliceCodeStubAssembler : public CodeStubAssembler {
+class ArrayPrototypeSliceCodeStubAssembler : public CodeStubAssembler {
  public:
-  explicit FastArraySliceCodeStubAssembler(compiler::CodeAssemblerState* state)
+  explicit ArrayPrototypeSliceCodeStubAssembler(
+      compiler::CodeAssemblerState* state)
       : CodeStubAssembler(state) {}
 
   Node* HandleFastSlice(Node* context, Node* array, Node* from, Node* count,
@@ -1106,13 +1147,20 @@ class FastArraySliceCodeStubAssembler : public CodeStubAssembler {
     // Check prototype chain if receiver does not have packed elements
     GotoIfNot(IsPrototypeInitialArrayPrototype(context, map), slow);
 
-    GotoIf(IsArrayProtectorCellInvalid(), slow);
+    GotoIf(IsNoElementsProtectorCellInvalid(), slow);
 
     GotoIf(IsSpeciesProtectorCellInvalid(), slow);
 
     // Bailout if receiver has slow elements.
     Node* elements_kind = LoadMapElementsKind(map);
     GotoIfNot(IsFastElementsKind(elements_kind), &try_simple_slice);
+
+    // Make sure that the length hasn't been changed by side-effect.
+    Node* array_length = LoadJSArrayLength(array);
+    GotoIf(TaggedIsNotSmi(array_length), slow);
+    GotoIf(SmiAbove(SmiAdd(from, count), array_length), slow);
+
+    CSA_ASSERT(this, SmiGreaterThanOrEqual(from, SmiConstant(0)));
 
     result.Bind(CallStub(CodeFactory::ExtractFastJSArray(isolate()), context,
                          array, from, count));
@@ -1139,6 +1187,8 @@ class FastArraySliceCodeStubAssembler : public CodeStubAssembler {
     GotoIf(SmiAboveOrEqual(count, SmiConstant(max_fast_elements)),
            &try_simple_slice);
 
+    GotoIf(SmiLessThan(from, SmiConstant(0)), slow);
+
     Node* end = SmiAdd(from, count);
 
     Node* unmapped_elements = LoadFixedArrayElement(
@@ -1146,7 +1196,7 @@ class FastArraySliceCodeStubAssembler : public CodeStubAssembler {
     Node* unmapped_elements_length =
         LoadFixedArrayBaseLength(unmapped_elements);
 
-    GotoIf(SmiGreaterThan(end, unmapped_elements_length), slow);
+    GotoIf(SmiAbove(end, unmapped_elements_length), slow);
 
     Node* array_map = LoadJSArrayElementsMap(HOLEY_ELEMENTS, native_context);
     result.Bind(AllocateJSArray(HOLEY_ELEMENTS, array_map, count, count,
@@ -1162,15 +1212,25 @@ class FastArraySliceCodeStubAssembler : public CodeStubAssembler {
     BuildFastLoop(
         var_list, from_mapped, to,
         [this, result_elements, arguments_context, sloppy_elements,
-         &index_out](Node* current) {
+         unmapped_elements, &index_out](Node* current) {
           Node* context_index = LoadFixedArrayElement(
               sloppy_elements, current,
               kPointerSize * SloppyArgumentsElements::kParameterMapStart,
               SMI_PARAMETERS);
-          Node* argument =
+          Label is_the_hole(this), done(this);
+          GotoIf(IsTheHole(context_index), &is_the_hole);
+          Node* mapped_argument =
               LoadContextElement(arguments_context, SmiUntag(context_index));
+          StoreFixedArrayElement(result_elements, index_out.value(),
+                                 mapped_argument, SKIP_WRITE_BARRIER);
+          Goto(&done);
+          BIND(&is_the_hole);
+          Node* argument = LoadFixedArrayElement(unmapped_elements, current, 0,
+                                                 SMI_PARAMETERS);
           StoreFixedArrayElement(result_elements, index_out.value(), argument,
                                  SKIP_WRITE_BARRIER);
+          Goto(&done);
+          BIND(&done);
           index_out.Bind(IntPtrAdd(index_out.value(), IntPtrConstant(1)));
         },
         1, SMI_PARAMETERS, IndexAdvanceMode::kPost);
@@ -1205,11 +1265,11 @@ class FastArraySliceCodeStubAssembler : public CodeStubAssembler {
   void CopyOneElement(Node* context, Node* o, Node* a, Node* p_k, Variable& n) {
     // b. Let kPresent be HasProperty(O, Pk).
     // c. ReturnIfAbrupt(kPresent).
-    Node* k_present = HasProperty(o, p_k, context, kHasProperty);
+    TNode<Oddball> k_present = HasProperty(o, p_k, context, kHasProperty);
 
     // d. If kPresent is true, then
     Label done_element(this);
-    GotoIf(WordNotEqual(k_present, TrueConstant()), &done_element);
+    GotoIf(IsFalse(k_present), &done_element);
 
     // i. Let kValue be Get(O, Pk).
     // ii. ReturnIfAbrupt(kValue).
@@ -1224,10 +1284,10 @@ class FastArraySliceCodeStubAssembler : public CodeStubAssembler {
   }
 };
 
-TF_BUILTIN(FastArraySlice, FastArraySliceCodeStubAssembler) {
+TF_BUILTIN(ArrayPrototypeSlice, ArrayPrototypeSliceCodeStubAssembler) {
   Node* const argc =
       ChangeInt32ToIntPtr(Parameter(BuiltinDescriptor::kArgumentsCount));
-  Node* const context = Parameter(BuiltinDescriptor::kContext);
+  TNode<Context> context = CAST(Parameter(BuiltinDescriptor::kContext));
   Label slow(this, Label::kDeferred), fast_elements_kind(this);
 
   CodeStubArguments args(this, argc);
@@ -1299,8 +1359,8 @@ TF_BUILTIN(FastArraySlice, FastArraySliceCodeStubAssembler) {
 
   // 5. Let relativeStart be ToInteger(start).
   // 6. ReturnIfAbrupt(relativeStart).
-  Node* arg0 = args.GetOptionalArgumentValue(0, SmiConstant(0));
-  Node* relative_start = ToInteger(context, arg0);
+  TNode<Object> arg0 = CAST(args.GetOptionalArgumentValue(0, SmiConstant(0)));
+  Node* relative_start = ToInteger_Inline(context, arg0);
 
   // 7. If relativeStart < 0, let k be max((len + relativeStart),0);
   //    else let k be min(relativeStart, len.value()).
@@ -1318,11 +1378,12 @@ TF_BUILTIN(FastArraySlice, FastArraySliceCodeStubAssembler) {
   // 8. If end is undefined, let relativeEnd be len;
   //    else let relativeEnd be ToInteger(end).
   // 9. ReturnIfAbrupt(relativeEnd).
-  Node* end = args.GetOptionalArgumentValue(1, UndefinedConstant());
+  TNode<Object> end =
+      CAST(args.GetOptionalArgumentValue(1, UndefinedConstant()));
   Label end_undefined(this), end_done(this);
   VARIABLE(relative_end, MachineRepresentation::kTagged);
   GotoIf(WordEqual(end, UndefinedConstant()), &end_undefined);
-  relative_end.Bind(ToInteger(context, end));
+  relative_end.Bind(ToInteger_Inline(context, end));
   Goto(&end_done);
   BIND(&end_undefined);
   relative_end.Bind(len.value());
@@ -1398,11 +1459,10 @@ TF_BUILTIN(FastArraySlice, FastArraySliceCodeStubAssembler) {
   args.PopAndReturn(a);
 }
 
-TF_BUILTIN(FastArrayShift, CodeStubAssembler) {
+TF_BUILTIN(ArrayPrototypeShift, CodeStubAssembler) {
   Node* argc = Parameter(BuiltinDescriptor::kArgumentsCount);
   Node* context = Parameter(BuiltinDescriptor::kContext);
-  CSA_ASSERT(this, WordEqual(Parameter(BuiltinDescriptor::kNewTarget),
-                             UndefinedConstant()));
+  CSA_ASSERT(this, IsUndefined(Parameter(BuiltinDescriptor::kNewTarget)));
 
   CodeStubArguments args(this, ChangeInt32ToIntPtr(argc));
   Node* receiver = args.GetReceiver();
@@ -1564,7 +1624,7 @@ TF_BUILTIN(ExtractFastJSArray, ArrayBuiltinCodeStubAssembler) {
   Node* count = TaggedToParameter(Parameter(Descriptor::kCount), mode);
 
   CSA_ASSERT(this, IsJSArray(array));
-  CSA_ASSERT(this, Word32BinaryNot(IsArrayProtectorCellInvalid()));
+  CSA_ASSERT(this, Word32BinaryNot(IsNoElementsProtectorCellInvalid()));
 
   Return(ExtractFastJSArray(context, array, begin, count, mode));
 }
@@ -1574,10 +1634,252 @@ TF_BUILTIN(CloneFastJSArray, ArrayBuiltinCodeStubAssembler) {
   Node* array = Parameter(Descriptor::kSource);
 
   CSA_ASSERT(this, IsJSArray(array));
-  CSA_ASSERT(this, Word32BinaryNot(IsArrayProtectorCellInvalid()));
+  CSA_ASSERT(this, Word32BinaryNot(IsNoElementsProtectorCellInvalid()));
 
   ParameterMode mode = OptimalParameterMode();
   Return(CloneFastJSArray(context, array, mode));
+}
+
+TF_BUILTIN(ArrayFindLoopContinuation, ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* array = Parameter(Descriptor::kArray);
+  Node* object = Parameter(Descriptor::kObject);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+  Node* to = Parameter(Descriptor::kTo);
+
+  InitIteratingArrayBuiltinLoopContinuation(context, receiver, callbackfn,
+                                            this_arg, array, object, initial_k,
+                                            len, to);
+
+  GenerateIteratingArrayBuiltinLoopContinuation(
+      &ArrayBuiltinCodeStubAssembler::FindProcessor,
+      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
+      MissingPropertyMode::kUseUndefined, ForEachDirection::kForward);
+}
+
+// Continuation that is called after an eager deoptimization from TF (ex. the
+// array changes during iteration).
+TF_BUILTIN(ArrayFindLoopEagerDeoptContinuation, ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+
+  Return(CallBuiltin(Builtins::kArrayFindLoopContinuation, context, receiver,
+                     callbackfn, this_arg, UndefinedConstant(), receiver,
+                     initial_k, len, UndefinedConstant()));
+}
+
+// Continuation that is called after a lazy deoptimization from TF (ex. the
+// callback function is no longer callable).
+TF_BUILTIN(ArrayFindLoopLazyDeoptContinuation, ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+
+  Return(CallBuiltin(Builtins::kArrayFindLoopContinuation, context, receiver,
+                     callbackfn, this_arg, UndefinedConstant(), receiver,
+                     initial_k, len, UndefinedConstant()));
+}
+
+// Continuation that is called after a lazy deoptimization from TF that happens
+// right after the callback and it's returned value must be handled before
+// iteration continues.
+TF_BUILTIN(ArrayFindLoopAfterCallbackLazyDeoptContinuation,
+           ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+  Node* found_value = Parameter(Descriptor::kFoundValue);
+  Node* is_found = Parameter(Descriptor::kIsFound);
+
+  // This custom lazy deopt point is right after the callback. find() needs
+  // to pick up at the next step, which is returning the element if the callback
+  // value is truthy.  Otherwise, continue the search by calling the
+  // continuation.
+  Label if_true(this), if_false(this);
+  BranchIfToBooleanIsTrue(is_found, &if_true, &if_false);
+  BIND(&if_true);
+  Return(found_value);
+  BIND(&if_false);
+  Return(CallBuiltin(Builtins::kArrayFindLoopContinuation, context, receiver,
+                     callbackfn, this_arg, UndefinedConstant(), receiver,
+                     initial_k, len, UndefinedConstant()));
+}
+
+// ES #sec-get-%typedarray%.prototype.find
+TF_BUILTIN(ArrayPrototypeFind, ArrayBuiltinCodeStubAssembler) {
+  Node* argc =
+      ChangeInt32ToIntPtr(Parameter(BuiltinDescriptor::kArgumentsCount));
+  CodeStubArguments args(this, argc);
+  Node* context = Parameter(BuiltinDescriptor::kContext);
+  Node* new_target = Parameter(BuiltinDescriptor::kNewTarget);
+  Node* receiver = args.GetReceiver();
+  Node* callbackfn = args.GetOptionalArgumentValue(0);
+  Node* this_arg = args.GetOptionalArgumentValue(1);
+
+  InitIteratingArrayBuiltinBody(context, receiver, callbackfn, this_arg,
+                                new_target, argc);
+
+  GenerateIteratingArrayBuiltinBody(
+      "Array.prototype.find",
+      &ArrayBuiltinCodeStubAssembler::FindResultGenerator,
+      &ArrayBuiltinCodeStubAssembler::FindProcessor,
+      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
+      Builtins::CallableFor(isolate(), Builtins::kArrayFindLoopContinuation),
+      MissingPropertyMode::kUseUndefined, ForEachDirection::kForward);
+}
+
+TF_BUILTIN(ArrayFindIndexLoopContinuation, ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* array = Parameter(Descriptor::kArray);
+  Node* object = Parameter(Descriptor::kObject);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+  Node* to = Parameter(Descriptor::kTo);
+
+  InitIteratingArrayBuiltinLoopContinuation(context, receiver, callbackfn,
+                                            this_arg, array, object, initial_k,
+                                            len, to);
+
+  GenerateIteratingArrayBuiltinLoopContinuation(
+      &ArrayBuiltinCodeStubAssembler::FindIndexProcessor,
+      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
+      MissingPropertyMode::kUseUndefined, ForEachDirection::kForward);
+}
+
+TF_BUILTIN(ArrayFindIndexLoopEagerDeoptContinuation,
+           ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+
+  Return(CallBuiltin(Builtins::kArrayFindIndexLoopContinuation, context,
+                     receiver, callbackfn, this_arg, SmiConstant(-1), receiver,
+                     initial_k, len, UndefinedConstant()));
+}
+
+TF_BUILTIN(ArrayFindIndexLoopLazyDeoptContinuation,
+           ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+
+  Return(CallBuiltin(Builtins::kArrayFindIndexLoopContinuation, context,
+                     receiver, callbackfn, this_arg, SmiConstant(-1), receiver,
+                     initial_k, len, UndefinedConstant()));
+}
+
+TF_BUILTIN(ArrayFindIndexLoopAfterCallbackLazyDeoptContinuation,
+           ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+  Node* found_value = Parameter(Descriptor::kFoundValue);
+  Node* is_found = Parameter(Descriptor::kIsFound);
+
+  // This custom lazy deopt point is right after the callback. find() needs
+  // to pick up at the next step, which is returning the element if the callback
+  // value is truthy.  Otherwise, continue the search by calling the
+  // continuation.
+  Label if_true(this), if_false(this);
+  BranchIfToBooleanIsTrue(is_found, &if_true, &if_false);
+  BIND(&if_true);
+  Return(found_value);
+  BIND(&if_false);
+  Return(CallBuiltin(Builtins::kArrayFindIndexLoopContinuation, context,
+                     receiver, callbackfn, this_arg, SmiConstant(-1), receiver,
+                     initial_k, len, UndefinedConstant()));
+}
+
+// ES #sec-get-%typedarray%.prototype.findIndex
+TF_BUILTIN(ArrayPrototypeFindIndex, ArrayBuiltinCodeStubAssembler) {
+  Node* argc =
+      ChangeInt32ToIntPtr(Parameter(BuiltinDescriptor::kArgumentsCount));
+  CodeStubArguments args(this, argc);
+  Node* context = Parameter(BuiltinDescriptor::kContext);
+  Node* new_target = Parameter(BuiltinDescriptor::kNewTarget);
+  Node* receiver = args.GetReceiver();
+  Node* callbackfn = args.GetOptionalArgumentValue(0);
+  Node* this_arg = args.GetOptionalArgumentValue(1);
+
+  InitIteratingArrayBuiltinBody(context, receiver, callbackfn, this_arg,
+                                new_target, argc);
+
+  GenerateIteratingArrayBuiltinBody(
+      "Array.prototype.findIndex",
+      &ArrayBuiltinCodeStubAssembler::FindIndexResultGenerator,
+      &ArrayBuiltinCodeStubAssembler::FindIndexProcessor,
+      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
+      Builtins::CallableFor(isolate(),
+                            Builtins::kArrayFindIndexLoopContinuation),
+      MissingPropertyMode::kUseUndefined, ForEachDirection::kForward);
+}
+
+// ES #sec-get-%typedarray%.prototype.find
+TF_BUILTIN(TypedArrayPrototypeFind, ArrayBuiltinCodeStubAssembler) {
+  Node* argc =
+      ChangeInt32ToIntPtr(Parameter(BuiltinDescriptor::kArgumentsCount));
+  CodeStubArguments args(this, argc);
+  Node* context = Parameter(BuiltinDescriptor::kContext);
+  Node* new_target = Parameter(BuiltinDescriptor::kNewTarget);
+  Node* receiver = args.GetReceiver();
+  Node* callbackfn = args.GetOptionalArgumentValue(0);
+  Node* this_arg = args.GetOptionalArgumentValue(1);
+
+  InitIteratingArrayBuiltinBody(context, receiver, callbackfn, this_arg,
+                                new_target, argc);
+
+  GenerateIteratingTypedArrayBuiltinBody(
+      "%TypedArray%.prototype.find",
+      &ArrayBuiltinCodeStubAssembler::FindResultGenerator,
+      &ArrayBuiltinCodeStubAssembler::FindProcessor,
+      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction);
+}
+
+// ES #sec-get-%typedarray%.prototype.findIndex
+TF_BUILTIN(TypedArrayPrototypeFindIndex, ArrayBuiltinCodeStubAssembler) {
+  Node* argc =
+      ChangeInt32ToIntPtr(Parameter(BuiltinDescriptor::kArgumentsCount));
+  CodeStubArguments args(this, argc);
+  Node* context = Parameter(BuiltinDescriptor::kContext);
+  Node* new_target = Parameter(BuiltinDescriptor::kNewTarget);
+  Node* receiver = args.GetReceiver();
+  Node* callbackfn = args.GetOptionalArgumentValue(0);
+  Node* this_arg = args.GetOptionalArgumentValue(1);
+
+  InitIteratingArrayBuiltinBody(context, receiver, callbackfn, this_arg,
+                                new_target, argc);
+
+  GenerateIteratingTypedArrayBuiltinBody(
+      "%TypedArray%.prototype.findIndex",
+      &ArrayBuiltinCodeStubAssembler::FindIndexResultGenerator,
+      &ArrayBuiltinCodeStubAssembler::FindIndexProcessor,
+      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction);
 }
 
 TF_BUILTIN(ArrayForEachLoopContinuation, ArrayBuiltinCodeStubAssembler) {
@@ -1597,7 +1899,8 @@ TF_BUILTIN(ArrayForEachLoopContinuation, ArrayBuiltinCodeStubAssembler) {
 
   GenerateIteratingArrayBuiltinLoopContinuation(
       &ArrayBuiltinCodeStubAssembler::ForEachProcessor,
-      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction);
+      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
+      MissingPropertyMode::kSkip);
 }
 
 TF_BUILTIN(ArrayForEachLoopEagerDeoptContinuation,
@@ -1609,11 +1912,9 @@ TF_BUILTIN(ArrayForEachLoopEagerDeoptContinuation,
   Node* initial_k = Parameter(Descriptor::kInitialK);
   Node* len = Parameter(Descriptor::kLength);
 
-  Callable stub(Builtins::CallableFor(isolate(),
-                                      Builtins::kArrayForEachLoopContinuation));
-  Return(CallStub(stub, context, receiver, callbackfn, this_arg,
-                  UndefinedConstant(), receiver, initial_k, len,
-                  UndefinedConstant()));
+  Return(CallBuiltin(Builtins::kArrayForEachLoopContinuation, context, receiver,
+                     callbackfn, this_arg, UndefinedConstant(), receiver,
+                     initial_k, len, UndefinedConstant()));
 }
 
 TF_BUILTIN(ArrayForEachLoopLazyDeoptContinuation,
@@ -1625,11 +1926,9 @@ TF_BUILTIN(ArrayForEachLoopLazyDeoptContinuation,
   Node* initial_k = Parameter(Descriptor::kInitialK);
   Node* len = Parameter(Descriptor::kLength);
 
-  Callable stub(Builtins::CallableFor(isolate(),
-                                      Builtins::kArrayForEachLoopContinuation));
-  Return(CallStub(stub, context, receiver, callbackfn, this_arg,
-                  UndefinedConstant(), receiver, initial_k, len,
-                  UndefinedConstant()));
+  Return(CallBuiltin(Builtins::kArrayForEachLoopContinuation, context, receiver,
+                     callbackfn, this_arg, UndefinedConstant(), receiver,
+                     initial_k, len, UndefinedConstant()));
 }
 
 TF_BUILTIN(ArrayForEach, ArrayBuiltinCodeStubAssembler) {
@@ -1650,8 +1949,8 @@ TF_BUILTIN(ArrayForEach, ArrayBuiltinCodeStubAssembler) {
       &ArrayBuiltinCodeStubAssembler::ForEachResultGenerator,
       &ArrayBuiltinCodeStubAssembler::ForEachProcessor,
       &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
-      Builtins::CallableFor(isolate(),
-                            Builtins::kArrayForEachLoopContinuation));
+      Builtins::CallableFor(isolate(), Builtins::kArrayForEachLoopContinuation),
+      MissingPropertyMode::kSkip);
 }
 
 TF_BUILTIN(TypedArrayPrototypeForEach, ArrayBuiltinCodeStubAssembler) {
@@ -1674,6 +1973,48 @@ TF_BUILTIN(TypedArrayPrototypeForEach, ArrayBuiltinCodeStubAssembler) {
       &ArrayBuiltinCodeStubAssembler::NullPostLoopAction);
 }
 
+TF_BUILTIN(ArraySomeLoopLazyDeoptContinuation, ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+  Node* result = Parameter(Descriptor::kResult);
+
+  // This custom lazy deopt point is right after the callback. every() needs
+  // to pick up at the next step, which is either continuing to the next
+  // array element or returning false if {result} is false.
+  Label true_continue(this), false_continue(this);
+
+  // iii. If selected is true, then...
+  BranchIfToBooleanIsTrue(result, &true_continue, &false_continue);
+  BIND(&true_continue);
+  { Return(TrueConstant()); }
+  BIND(&false_continue);
+  {
+    // Increment k.
+    initial_k = NumberInc(initial_k);
+
+    Return(CallBuiltin(Builtins::kArraySomeLoopContinuation, context, receiver,
+                       callbackfn, this_arg, FalseConstant(), receiver,
+                       initial_k, len, UndefinedConstant()));
+  }
+}
+
+TF_BUILTIN(ArraySomeLoopEagerDeoptContinuation, ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+
+  Return(CallBuiltin(Builtins::kArraySomeLoopContinuation, context, receiver,
+                     callbackfn, this_arg, FalseConstant(), receiver, initial_k,
+                     len, UndefinedConstant()));
+}
+
 TF_BUILTIN(ArraySomeLoopContinuation, ArrayBuiltinCodeStubAssembler) {
   Node* context = Parameter(Descriptor::kContext);
   Node* receiver = Parameter(Descriptor::kReceiver);
@@ -1691,7 +2032,8 @@ TF_BUILTIN(ArraySomeLoopContinuation, ArrayBuiltinCodeStubAssembler) {
 
   GenerateIteratingArrayBuiltinLoopContinuation(
       &ArrayBuiltinCodeStubAssembler::SomeProcessor,
-      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction);
+      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
+      MissingPropertyMode::kSkip);
 }
 
 TF_BUILTIN(ArraySome, ArrayBuiltinCodeStubAssembler) {
@@ -1712,7 +2054,8 @@ TF_BUILTIN(ArraySome, ArrayBuiltinCodeStubAssembler) {
       &ArrayBuiltinCodeStubAssembler::SomeResultGenerator,
       &ArrayBuiltinCodeStubAssembler::SomeProcessor,
       &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
-      Builtins::CallableFor(isolate(), Builtins::kArraySomeLoopContinuation));
+      Builtins::CallableFor(isolate(), Builtins::kArraySomeLoopContinuation),
+      MissingPropertyMode::kSkip);
 }
 
 TF_BUILTIN(TypedArrayPrototypeSome, ArrayBuiltinCodeStubAssembler) {
@@ -1735,6 +2078,49 @@ TF_BUILTIN(TypedArrayPrototypeSome, ArrayBuiltinCodeStubAssembler) {
       &ArrayBuiltinCodeStubAssembler::NullPostLoopAction);
 }
 
+TF_BUILTIN(ArrayEveryLoopLazyDeoptContinuation, ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+  Node* result = Parameter(Descriptor::kResult);
+
+  // This custom lazy deopt point is right after the callback. every() needs
+  // to pick up at the next step, which is either continuing to the next
+  // array element or returning false if {result} is false.
+  Label true_continue(this), false_continue(this);
+
+  // iii. If selected is true, then...
+  BranchIfToBooleanIsTrue(result, &true_continue, &false_continue);
+  BIND(&true_continue);
+  {
+    // Increment k.
+    initial_k = NumberInc(initial_k);
+
+    Return(CallBuiltin(Builtins::kArrayEveryLoopContinuation, context, receiver,
+                       callbackfn, this_arg, TrueConstant(), receiver,
+                       initial_k, len, UndefinedConstant()));
+  }
+  BIND(&false_continue);
+  { Return(FalseConstant()); }
+}
+
+TF_BUILTIN(ArrayEveryLoopEagerDeoptContinuation,
+           ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* this_arg = Parameter(Descriptor::kThisArg);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+
+  Return(CallBuiltin(Builtins::kArrayEveryLoopContinuation, context, receiver,
+                     callbackfn, this_arg, TrueConstant(), receiver, initial_k,
+                     len, UndefinedConstant()));
+}
+
 TF_BUILTIN(ArrayEveryLoopContinuation, ArrayBuiltinCodeStubAssembler) {
   Node* context = Parameter(Descriptor::kContext);
   Node* receiver = Parameter(Descriptor::kReceiver);
@@ -1752,7 +2138,8 @@ TF_BUILTIN(ArrayEveryLoopContinuation, ArrayBuiltinCodeStubAssembler) {
 
   GenerateIteratingArrayBuiltinLoopContinuation(
       &ArrayBuiltinCodeStubAssembler::EveryProcessor,
-      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction);
+      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
+      MissingPropertyMode::kSkip);
 }
 
 TF_BUILTIN(ArrayEvery, ArrayBuiltinCodeStubAssembler) {
@@ -1773,7 +2160,8 @@ TF_BUILTIN(ArrayEvery, ArrayBuiltinCodeStubAssembler) {
       &ArrayBuiltinCodeStubAssembler::EveryResultGenerator,
       &ArrayBuiltinCodeStubAssembler::EveryProcessor,
       &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
-      Builtins::CallableFor(isolate(), Builtins::kArrayEveryLoopContinuation));
+      Builtins::CallableFor(isolate(), Builtins::kArrayEveryLoopContinuation),
+      MissingPropertyMode::kSkip);
 }
 
 TF_BUILTIN(TypedArrayPrototypeEvery, ArrayBuiltinCodeStubAssembler) {
@@ -1813,7 +2201,38 @@ TF_BUILTIN(ArrayReduceLoopContinuation, ArrayBuiltinCodeStubAssembler) {
 
   GenerateIteratingArrayBuiltinLoopContinuation(
       &ArrayBuiltinCodeStubAssembler::ReduceProcessor,
-      &ArrayBuiltinCodeStubAssembler::ReducePostLoopAction);
+      &ArrayBuiltinCodeStubAssembler::ReducePostLoopAction,
+      MissingPropertyMode::kSkip);
+}
+
+TF_BUILTIN(ArrayReduceLoopEagerDeoptContinuation,
+           ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* accumulator = Parameter(Descriptor::kAccumulator);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+
+  Callable stub(
+      Builtins::CallableFor(isolate(), Builtins::kArrayReduceLoopContinuation));
+  Return(CallStub(stub, context, receiver, callbackfn, UndefinedConstant(),
+                  accumulator, receiver, initial_k, len, UndefinedConstant()));
+}
+
+TF_BUILTIN(ArrayReduceLoopLazyDeoptContinuation,
+           ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+  Node* result = Parameter(Descriptor::kResult);
+
+  Callable stub(
+      Builtins::CallableFor(isolate(), Builtins::kArrayReduceLoopContinuation));
+  Return(CallStub(stub, context, receiver, callbackfn, UndefinedConstant(),
+                  result, receiver, initial_k, len, UndefinedConstant()));
 }
 
 TF_BUILTIN(ArrayReduce, ArrayBuiltinCodeStubAssembler) {
@@ -1834,7 +2253,8 @@ TF_BUILTIN(ArrayReduce, ArrayBuiltinCodeStubAssembler) {
       &ArrayBuiltinCodeStubAssembler::ReduceResultGenerator,
       &ArrayBuiltinCodeStubAssembler::ReduceProcessor,
       &ArrayBuiltinCodeStubAssembler::ReducePostLoopAction,
-      Builtins::CallableFor(isolate(), Builtins::kArrayReduceLoopContinuation));
+      Builtins::CallableFor(isolate(), Builtins::kArrayReduceLoopContinuation),
+      MissingPropertyMode::kSkip);
 }
 
 TF_BUILTIN(TypedArrayPrototypeReduce, ArrayBuiltinCodeStubAssembler) {
@@ -1875,7 +2295,37 @@ TF_BUILTIN(ArrayReduceRightLoopContinuation, ArrayBuiltinCodeStubAssembler) {
   GenerateIteratingArrayBuiltinLoopContinuation(
       &ArrayBuiltinCodeStubAssembler::ReduceProcessor,
       &ArrayBuiltinCodeStubAssembler::ReducePostLoopAction,
-      ForEachDirection::kReverse);
+      MissingPropertyMode::kSkip, ForEachDirection::kReverse);
+}
+
+TF_BUILTIN(ArrayReduceRightLoopEagerDeoptContinuation,
+           ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* accumulator = Parameter(Descriptor::kAccumulator);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+
+  Callable stub(Builtins::CallableFor(
+      isolate(), Builtins::kArrayReduceRightLoopContinuation));
+  Return(CallStub(stub, context, receiver, callbackfn, UndefinedConstant(),
+                  accumulator, receiver, initial_k, len, UndefinedConstant()));
+}
+
+TF_BUILTIN(ArrayReduceRightLoopLazyDeoptContinuation,
+           ArrayBuiltinCodeStubAssembler) {
+  Node* context = Parameter(Descriptor::kContext);
+  Node* receiver = Parameter(Descriptor::kReceiver);
+  Node* callbackfn = Parameter(Descriptor::kCallbackFn);
+  Node* initial_k = Parameter(Descriptor::kInitialK);
+  Node* len = Parameter(Descriptor::kLength);
+  Node* result = Parameter(Descriptor::kResult);
+
+  Callable stub(Builtins::CallableFor(
+      isolate(), Builtins::kArrayReduceRightLoopContinuation));
+  Return(CallStub(stub, context, receiver, callbackfn, UndefinedConstant(),
+                  result, receiver, initial_k, len, UndefinedConstant()));
 }
 
 TF_BUILTIN(ArrayReduceRight, ArrayBuiltinCodeStubAssembler) {
@@ -1898,7 +2348,7 @@ TF_BUILTIN(ArrayReduceRight, ArrayBuiltinCodeStubAssembler) {
       &ArrayBuiltinCodeStubAssembler::ReducePostLoopAction,
       Builtins::CallableFor(isolate(),
                             Builtins::kArrayReduceRightLoopContinuation),
-      ForEachDirection::kReverse);
+      MissingPropertyMode::kSkip, ForEachDirection::kReverse);
 }
 
 TF_BUILTIN(TypedArrayPrototypeReduceRight, ArrayBuiltinCodeStubAssembler) {
@@ -1939,7 +2389,8 @@ TF_BUILTIN(ArrayFilterLoopContinuation, ArrayBuiltinCodeStubAssembler) {
 
   GenerateIteratingArrayBuiltinLoopContinuation(
       &ArrayBuiltinCodeStubAssembler::FilterProcessor,
-      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction);
+      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
+      MissingPropertyMode::kSkip);
 }
 
 TF_BUILTIN(ArrayFilterLoopEagerDeoptContinuation,
@@ -1953,10 +2404,9 @@ TF_BUILTIN(ArrayFilterLoopEagerDeoptContinuation,
   Node* len = Parameter(Descriptor::kLength);
   Node* to = Parameter(Descriptor::kTo);
 
-  Callable stub(
-      Builtins::CallableFor(isolate(), Builtins::kArrayFilterLoopContinuation));
-  Return(CallStub(stub, context, receiver, callbackfn, this_arg, array,
-                  receiver, initial_k, len, to));
+  Return(CallBuiltin(Builtins::kArrayFilterLoopContinuation, context, receiver,
+                     callbackfn, this_arg, array, receiver, initial_k, len,
+                     to));
 }
 
 TF_BUILTIN(ArrayFilterLoopLazyDeoptContinuation,
@@ -1996,10 +2446,9 @@ TF_BUILTIN(ArrayFilterLoopLazyDeoptContinuation,
   // Increment k.
   initial_k = NumberInc(initial_k);
 
-  Callable stub(
-      Builtins::CallableFor(isolate(), Builtins::kArrayFilterLoopContinuation));
-  Return(CallStub(stub, context, receiver, callbackfn, this_arg, array,
-                  receiver, initial_k, len, to.value()));
+  Return(CallBuiltin(Builtins::kArrayFilterLoopContinuation, context, receiver,
+                     callbackfn, this_arg, array, receiver, initial_k, len,
+                     to.value()));
 }
 
 TF_BUILTIN(ArrayFilter, ArrayBuiltinCodeStubAssembler) {
@@ -2020,7 +2469,8 @@ TF_BUILTIN(ArrayFilter, ArrayBuiltinCodeStubAssembler) {
       &ArrayBuiltinCodeStubAssembler::FilterResultGenerator,
       &ArrayBuiltinCodeStubAssembler::FilterProcessor,
       &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
-      Builtins::CallableFor(isolate(), Builtins::kArrayFilterLoopContinuation));
+      Builtins::CallableFor(isolate(), Builtins::kArrayFilterLoopContinuation),
+      MissingPropertyMode::kSkip);
 }
 
 TF_BUILTIN(ArrayMapLoopContinuation, ArrayBuiltinCodeStubAssembler) {
@@ -2040,7 +2490,8 @@ TF_BUILTIN(ArrayMapLoopContinuation, ArrayBuiltinCodeStubAssembler) {
 
   GenerateIteratingArrayBuiltinLoopContinuation(
       &ArrayBuiltinCodeStubAssembler::SpecCompliantMapProcessor,
-      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction);
+      &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
+      MissingPropertyMode::kSkip);
 }
 
 TF_BUILTIN(ArrayMapLoopEagerDeoptContinuation, ArrayBuiltinCodeStubAssembler) {
@@ -2052,10 +2503,9 @@ TF_BUILTIN(ArrayMapLoopEagerDeoptContinuation, ArrayBuiltinCodeStubAssembler) {
   Node* initial_k = Parameter(Descriptor::kInitialK);
   Node* len = Parameter(Descriptor::kLength);
 
-  Callable stub(
-      Builtins::CallableFor(isolate(), Builtins::kArrayMapLoopContinuation));
-  Return(CallStub(stub, context, receiver, callbackfn, this_arg, array,
-                  receiver, initial_k, len, UndefinedConstant()));
+  Return(CallBuiltin(Builtins::kArrayMapLoopContinuation, context, receiver,
+                     callbackfn, this_arg, array, receiver, initial_k, len,
+                     UndefinedConstant()));
 }
 
 TF_BUILTIN(ArrayMapLoopLazyDeoptContinuation, ArrayBuiltinCodeStubAssembler) {
@@ -2078,10 +2528,9 @@ TF_BUILTIN(ArrayMapLoopLazyDeoptContinuation, ArrayBuiltinCodeStubAssembler) {
   // Then we have to increment k before going on.
   initial_k = NumberInc(initial_k);
 
-  Callable stub(
-      Builtins::CallableFor(isolate(), Builtins::kArrayMapLoopContinuation));
-  Return(CallStub(stub, context, receiver, callbackfn, this_arg, array,
-                  receiver, initial_k, len, UndefinedConstant()));
+  Return(CallBuiltin(Builtins::kArrayMapLoopContinuation, context, receiver,
+                     callbackfn, this_arg, array, receiver, initial_k, len,
+                     UndefinedConstant()));
 }
 
 TF_BUILTIN(ArrayMap, ArrayBuiltinCodeStubAssembler) {
@@ -2101,7 +2550,8 @@ TF_BUILTIN(ArrayMap, ArrayBuiltinCodeStubAssembler) {
       "Array.prototype.map", &ArrayBuiltinCodeStubAssembler::MapResultGenerator,
       &ArrayBuiltinCodeStubAssembler::FastMapProcessor,
       &ArrayBuiltinCodeStubAssembler::NullPostLoopAction,
-      Builtins::CallableFor(isolate(), Builtins::kArrayMapLoopContinuation));
+      Builtins::CallableFor(isolate(), Builtins::kArrayMapLoopContinuation),
+      MissingPropertyMode::kSkip);
 }
 
 TF_BUILTIN(TypedArrayPrototypeMap, ArrayBuiltinCodeStubAssembler) {
@@ -2140,10 +2590,10 @@ TF_BUILTIN(ArrayIsArray, CodeStubAssembler) {
          &return_false);
 
   BIND(&return_true);
-  Return(BooleanConstant(true));
+  Return(TrueConstant());
 
   BIND(&return_false);
-  Return(BooleanConstant(false));
+  Return(FalseConstant());
 
   BIND(&call_runtime);
   Return(CallRuntime(Runtime::kArrayIsArray, context, object));
@@ -2344,7 +2794,8 @@ void ArrayIncludesIndexofAssembler::Generate(SearchVariant variant) {
       TNode<String> search_element_string = CAST(search_element);
       Label continue_loop(this), next_iteration(this, &index_var),
           slow_compare(this), runtime(this, Label::kDeferred);
-      Node* search_length = LoadStringLength(search_element_string);
+      TNode<IntPtrT> search_length =
+          LoadStringLengthAsWord(search_element_string);
       Goto(&next_iteration);
       BIND(&next_iteration);
       GotoIfNot(UintPtrLessThan(index_var.value(), array_length),
@@ -2354,19 +2805,18 @@ void ArrayIncludesIndexofAssembler::Generate(SearchVariant variant) {
       GotoIf(WordEqual(search_element_string, element_k), &return_found);
       Node* element_k_type = LoadInstanceType(element_k);
       GotoIfNot(IsStringInstanceType(element_k_type), &continue_loop);
-      Branch(WordEqual(search_length, LoadStringLength(element_k)),
+      Branch(WordEqual(search_length, LoadStringLengthAsWord(element_k)),
              &slow_compare, &continue_loop);
 
       BIND(&slow_compare);
       StringBuiltinsAssembler string_asm(state());
       string_asm.StringEqual_Core(context, search_element_string, search_type,
-                                  search_length, element_k, element_k_type,
+                                  element_k, element_k_type, search_length,
                                   &return_found, &continue_loop, &runtime);
       BIND(&runtime);
       TNode<Object> result = CallRuntime(Runtime::kStringEqual, context,
                                          search_element_string, element_k);
-      Branch(WordEqual(BooleanConstant(true), result), &return_found,
-             &continue_loop);
+      Branch(WordEqual(result, TrueConstant()), &return_found, &continue_loop);
 
       BIND(&continue_loop);
       Increment(&index_var);
@@ -2377,10 +2827,16 @@ void ArrayIncludesIndexofAssembler::Generate(SearchVariant variant) {
     {
       GotoIfNot(UintPtrLessThan(index_var.value(), array_length),
                 &return_not_found);
+
       Node* element_k = LoadFixedArrayElement(elements, index_var.value());
-      TNode<Object> result = CallRuntime(Runtime::kBigIntEqual, context,
+      Label continue_loop(this);
+      GotoIf(TaggedIsSmi(element_k), &continue_loop);
+      GotoIfNot(IsBigInt(element_k), &continue_loop);
+      TNode<Object> result = CallRuntime(Runtime::kBigIntEqualToBigInt, context,
                                          search_element, element_k);
-      GotoIf(WordEqual(result, TrueConstant()), &return_found);
+      Branch(WordEqual(result, TrueConstant()), &return_found, &continue_loop);
+
+      BIND(&continue_loop);
       Increment(&index_var);
       Goto(&bigint_loop);
     }
@@ -2701,8 +3157,9 @@ TF_BUILTIN(ArrayIteratorPrototypeNext, CodeStubAssembler) {
 
     BIND(&holey_object_values);
     {
-      // Check the array_protector cell, and take the slow path if it's invalid.
-      GotoIf(IsArrayProtectorCellInvalid(), &generic_values);
+      // Check the no_elements_protector cell, and take the slow path if it's
+      // invalid.
+      GotoIf(IsNoElementsProtectorCellInvalid(), &generic_values);
 
       var_value.Bind(UndefinedConstant());
       Node* value = LoadFixedArrayElement(elements, index, 0, SMI_PARAMETERS);
@@ -2713,8 +3170,9 @@ TF_BUILTIN(ArrayIteratorPrototypeNext, CodeStubAssembler) {
 
     BIND(&holey_double_values);
     {
-      // Check the array_protector cell, and take the slow path if it's invalid.
-      GotoIf(IsArrayProtectorCellInvalid(), &generic_values);
+      // Check the no_elements_protector cell, and take the slow path if it's
+      // invalid.
+      GotoIf(IsNoElementsProtectorCellInvalid(), &generic_values);
 
       var_value.Bind(UndefinedConstant());
       Node* value = LoadFixedDoubleArrayElement(
@@ -2730,7 +3188,7 @@ TF_BUILTIN(ArrayIteratorPrototypeNext, CodeStubAssembler) {
     Label if_istypedarray(this), if_isgeneric(this);
 
     // If a is undefined, return CreateIterResultObject(undefined, true)
-    GotoIf(WordEqual(array, UndefinedConstant()), &allocate_iterator_result);
+    GotoIf(IsUndefined(array), &allocate_iterator_result);
 
     Node* array_type = LoadInstanceType(array);
     Branch(InstanceTypeEqual(array_type, JS_TYPED_ARRAY_TYPE), &if_istypedarray,
@@ -2759,7 +3217,7 @@ TF_BUILTIN(ArrayIteratorPrototypeNext, CodeStubAssembler) {
           {
             Label if_invalid(this, Label::kDeferred);
             // A fast array iterator transitioned to a slow iterator during
-            // iteration. Invalidate fast_array_iteration_prtoector cell to
+            // iteration. Invalidate fast_array_iteration_protector cell to
             // prevent potential deopt loops.
             StoreObjectFieldNoWriteBarrier(
                 iterator, JSArrayIterator::kIteratedObjectMapOffset,

@@ -60,6 +60,7 @@ REPLACE_STUB_CALL(Subtract)
 REPLACE_STUB_CALL(Multiply)
 REPLACE_STUB_CALL(Divide)
 REPLACE_STUB_CALL(Modulus)
+REPLACE_STUB_CALL(Exponentiate)
 REPLACE_STUB_CALL(BitwiseAnd)
 REPLACE_STUB_CALL(BitwiseOr)
 REPLACE_STUB_CALL(BitwiseXor)
@@ -70,11 +71,16 @@ REPLACE_STUB_CALL(LessThan)
 REPLACE_STUB_CALL(LessThanOrEqual)
 REPLACE_STUB_CALL(GreaterThan)
 REPLACE_STUB_CALL(GreaterThanOrEqual)
+REPLACE_STUB_CALL(BitwiseNot)
+REPLACE_STUB_CALL(Decrement)
+REPLACE_STUB_CALL(Increment)
+REPLACE_STUB_CALL(Negate)
 REPLACE_STUB_CALL(HasProperty)
 REPLACE_STUB_CALL(Equal)
 REPLACE_STUB_CALL(ToInteger)
 REPLACE_STUB_CALL(ToLength)
 REPLACE_STUB_CALL(ToNumber)
+REPLACE_STUB_CALL(ToNumeric)
 REPLACE_STUB_CALL(ToName)
 REPLACE_STUB_CALL(ToObject)
 REPLACE_STUB_CALL(ToString)
@@ -245,32 +251,17 @@ void JSGenericLowering::LowerJSStoreGlobal(Node* node) {
   const StoreGlobalParameters& p = StoreGlobalParametersOf(node->op());
   Node* frame_state = NodeProperties::GetFrameStateInput(node);
   Node* outer_state = frame_state->InputAt(kFrameStateOuterStateInput);
-  Node* context = NodeProperties::GetContextInput(node);
-  Node* effect = NodeProperties::GetEffectInput(node);
-  Node* control = NodeProperties::GetControlInput(node);
-  // Load global object from the context.
-  Node* native_context = effect =
-      graph()->NewNode(machine()->Load(MachineType::AnyTagged()), context,
-                       jsgraph()->IntPtrConstant(
-                           Context::SlotOffset(Context::NATIVE_CONTEXT_INDEX)),
-                       effect, control);
-  Node* global = effect = graph()->NewNode(
-      machine()->Load(MachineType::AnyTagged()), native_context,
-      jsgraph()->IntPtrConstant(Context::SlotOffset(Context::EXTENSION_INDEX)),
-      effect, control);
-  NodeProperties::ReplaceEffectInput(node, effect);
-  node->InsertInput(zone(), 0, global);
-  node->InsertInput(zone(), 1, jsgraph()->HeapConstant(p.name()));
-  node->InsertInput(zone(), 3, jsgraph()->SmiConstant(p.feedback().index()));
+  node->InsertInput(zone(), 0, jsgraph()->HeapConstant(p.name()));
+  node->InsertInput(zone(), 2, jsgraph()->SmiConstant(p.feedback().index()));
   if (outer_state->opcode() != IrOpcode::kFrameState) {
     Callable callable =
-        CodeFactory::StoreGlobalIC(isolate(), p.language_mode());
+        Builtins::CallableFor(isolate(), Builtins::kStoreGlobalICTrampoline);
     ReplaceWithStubCall(node, callable, flags);
   } else {
     Callable callable =
-        CodeFactory::StoreGlobalICInOptimizedCode(isolate(), p.language_mode());
+        Builtins::CallableFor(isolate(), Builtins::kStoreGlobalIC);
     Node* vector = jsgraph()->HeapConstant(p.feedback().vector());
-    node->InsertInput(zone(), 4, vector);
+    node->InsertInput(zone(), 3, vector);
     ReplaceWithStubCall(node, callable, flags);
   }
 }
@@ -517,12 +508,6 @@ void JSGenericLowering::LowerJSCreateBlockContext(Node* node) {
 }
 
 
-void JSGenericLowering::LowerJSCreateScriptContext(Node* node) {
-  Handle<ScopeInfo> scope_info = OpParameter<Handle<ScopeInfo>>(node);
-  node->InsertInput(zone(), 1, jsgraph()->HeapConstant(scope_info));
-  ReplaceWithRuntimeCall(node, Runtime::kNewScriptContext);
-}
-
 void JSGenericLowering::LowerJSConstructForwardVarargs(Node* node) {
   ConstructForwardVarargsParameters p =
       ConstructForwardVarargsParametersOf(node->op());
@@ -675,10 +660,6 @@ void JSGenericLowering::LowerJSCallRuntime(Node* node) {
   ReplaceWithRuntimeCall(node, p.id(), static_cast<int>(p.arity()));
 }
 
-void JSGenericLowering::LowerJSConvertReceiver(Node* node) {
-  ReplaceWithRuntimeCall(node, Runtime::kConvertReceiver);
-}
-
 void JSGenericLowering::LowerJSForInNext(Node* node) {
   UNREACHABLE();  // Eliminated in typed lowering.
 }
@@ -709,6 +690,10 @@ void JSGenericLowering::LowerJSGeneratorStore(Node* node) {
 }
 
 void JSGenericLowering::LowerJSGeneratorRestoreContinuation(Node* node) {
+  UNREACHABLE();  // Eliminated in typed lowering.
+}
+
+void JSGenericLowering::LowerJSGeneratorRestoreInputOrDebugPos(Node* node) {
   UNREACHABLE();  // Eliminated in typed lowering.
 }
 

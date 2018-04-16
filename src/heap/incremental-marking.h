@@ -20,28 +20,7 @@ class Object;
 class PagedSpace;
 
 enum class StepOrigin { kV8, kTask };
-
-// This marking state is used when concurrent marking is running.
-class IncrementalMarkingState final
-    : public MarkingStateBase<IncrementalMarkingState, AccessMode::ATOMIC> {
- public:
-  Bitmap* bitmap(const MemoryChunk* chunk) const {
-    return Bitmap::FromAddress(chunk->address() + MemoryChunk::kHeaderSize);
-  }
-
-  // Concurrent marking uses local live bytes.
-  void IncrementLiveBytes(MemoryChunk* chunk, intptr_t by) {
-    chunk->live_byte_count_ += by;
-  }
-
-  intptr_t live_bytes(MemoryChunk* chunk) const {
-    return chunk->live_byte_count_;
-  }
-
-  void SetLiveBytes(MemoryChunk* chunk, intptr_t value) {
-    chunk->live_byte_count_ = value;
-  }
-};
+enum class WorklistToProcess { kAll, kBailout };
 
 class V8_EXPORT_PRIVATE IncrementalMarking {
  public:
@@ -57,7 +36,7 @@ class V8_EXPORT_PRIVATE IncrementalMarking {
   using MarkingState = IncrementalMarkingState;
 #else
   using MarkingState = MajorNonAtomicMarkingState;
-#endif
+#endif  // V8_CONCURRENT_MARKING
   using AtomicMarkingState = MajorAtomicMarkingState;
   using NonAtomicMarkingState = MajorNonAtomicMarkingState;
 
@@ -186,6 +165,7 @@ class V8_EXPORT_PRIVATE IncrementalMarking {
   void FinalizeIncrementally();
 
   void UpdateMarkingWorklistAfterScavenge();
+  void UpdateMarkedBytesAfterScavenge(size_t dead_bytes_in_new_space);
 
   void Hurry();
 
@@ -209,7 +189,8 @@ class V8_EXPORT_PRIVATE IncrementalMarking {
   void FinalizeSweeping();
 
   size_t Step(size_t bytes_to_process, CompletionAction action,
-              StepOrigin step_origin);
+              StepOrigin step_origin,
+              WorklistToProcess worklist_to_process = WorklistToProcess::kAll);
 
   inline void RestartIfNotMarking();
 
@@ -317,6 +298,7 @@ class V8_EXPORT_PRIVATE IncrementalMarking {
   void DeactivateIncrementalWriteBarrierForSpace(NewSpace* space);
   void DeactivateIncrementalWriteBarrier();
 
+  template <WorklistToProcess worklist_to_process = WorklistToProcess::kAll>
   V8_INLINE intptr_t ProcessMarkingWorklist(
       intptr_t bytes_to_process,
       ForceCompletionAction completion = DO_NOT_FORCE_COMPLETION);
@@ -348,6 +330,10 @@ class V8_EXPORT_PRIVATE IncrementalMarking {
   size_t old_generation_allocation_counter_;
   size_t bytes_allocated_;
   size_t bytes_marked_ahead_of_schedule_;
+  // A sample of concurrent_marking()->TotalMarkedBytes() at the last
+  // incremental marking step. It is used for updating
+  // bytes_marked_ahead_of_schedule_ with contribution of concurrent marking.
+  size_t bytes_marked_concurrently_;
   size_t unscanned_bytes_of_large_object_;
 
   // Must use SetState() above to update state_

@@ -20,6 +20,7 @@ class BigInt;
 class BytecodeArray;
 class JSArrayBuffer;
 class JSRegExp;
+class JSWeakCollection;
 
 #define TYPED_VISITOR_ID_LIST(V) \
   V(AllocationSite)              \
@@ -28,6 +29,7 @@ class JSRegExp;
   V(BytecodeArray)               \
   V(Cell)                        \
   V(Code)                        \
+  V(CodeDataContainer)           \
   V(ConsString)                  \
   V(FeedbackVector)              \
   V(FixedArray)                  \

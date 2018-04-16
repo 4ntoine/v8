@@ -525,9 +525,40 @@ void ConsString::set_second(String* value, WriteBarrierMode mode) {
 
 ACCESSORS(ThinString, actual, String, kActualOffset);
 
+HeapObject* ThinString::unchecked_actual() const {
+  return reinterpret_cast<HeapObject*>(READ_FIELD(this, kActualOffset));
+}
+
 bool ExternalString::is_short() {
   InstanceType type = map()->instance_type();
   return (type & kShortExternalStringMask) == kShortExternalStringTag;
+}
+
+Address ExternalString::resource_as_address() {
+  return *reinterpret_cast<Address*>(FIELD_ADDR(this, kResourceOffset));
+}
+
+void ExternalString::set_address_as_resource(Address address) {
+  DCHECK(IsAligned(reinterpret_cast<intptr_t>(address), kPointerSize));
+  *reinterpret_cast<Address*>(FIELD_ADDR(this, kResourceOffset)) = address;
+  if (IsExternalOneByteString()) {
+    ExternalOneByteString::cast(this)->update_data_cache();
+  } else {
+    ExternalTwoByteString::cast(this)->update_data_cache();
+  }
+}
+
+uint32_t ExternalString::resource_as_uint32() {
+  return static_cast<uint32_t>(
+      *reinterpret_cast<uintptr_t*>(FIELD_ADDR(this, kResourceOffset)));
+}
+
+void ExternalString::set_uint32_as_resource(uint32_t value) {
+  *reinterpret_cast<uintptr_t*>(FIELD_ADDR(this, kResourceOffset)) = value;
+  if (is_short()) return;
+  const char** data_field =
+      reinterpret_cast<const char**>(FIELD_ADDR(this, kResourceDataOffset));
+  *data_field = nullptr;
 }
 
 const ExternalOneByteString::Resource* ExternalOneByteString::resource() {
@@ -664,30 +695,6 @@ bool String::AsArrayIndex(uint32_t* index) {
     return false;
   }
   return SlowAsArrayIndex(index);
-}
-
-void String::SetForwardedInternalizedString(String* canonical) {
-  DCHECK(IsInternalizedString());
-  DCHECK(HasHashCode());
-  if (canonical == this) return;  // No need to forward.
-  DCHECK(SlowEquals(canonical));
-  DCHECK(canonical->IsInternalizedString());
-  DCHECK(canonical->HasHashCode());
-  WRITE_FIELD(this, kHashFieldSlot, canonical);
-  // Setting the hash field to a tagged value sets the LSB, causing the hash
-  // code to be interpreted as uninitialized.  We use this fact to recognize
-  // that we have a forwarded string.
-  DCHECK(!HasHashCode());
-}
-
-String* String::GetForwardedInternalizedString() {
-  DCHECK(IsInternalizedString());
-  if (HasHashCode()) return this;
-  String* canonical = String::cast(READ_FIELD(this, kHashFieldSlot));
-  DCHECK(canonical->IsInternalizedString());
-  DCHECK(SlowEquals(canonical));
-  DCHECK(canonical->HasHashCode());
-  return canonical;
 }
 
 String::SubStringRange::SubStringRange(String* string, int first, int length)

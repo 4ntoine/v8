@@ -38,7 +38,7 @@ class RegisterTransferWriter final
 };
 
 BytecodeArrayBuilder::BytecodeArrayBuilder(
-    Isolate* isolate, Zone* zone, int parameter_count, int locals_count,
+    Zone* zone, int parameter_count, int locals_count,
     FeedbackVectorSpec* feedback_vector_spec,
     SourcePositionTableBuilder::RecordingMode source_position_mode)
     : zone_(zone),
@@ -362,6 +362,9 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::BinaryOperation(Token::Value op,
     case Token::Value::MOD:
       OutputMod(reg, feedback_slot);
       break;
+    case Token::Value::EXP:
+      OutputExp(reg, feedback_slot);
+      break;
     case Token::Value::BIT_OR:
       OutputBitwiseOr(reg, feedback_slot);
       break;
@@ -403,6 +406,9 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::BinaryOperationSmiLiteral(
       break;
     case Token::Value::MOD:
       OutputModSmi(literal->value(), feedback_slot);
+      break;
+    case Token::Value::EXP:
+      OutputExpSmi(literal->value(), feedback_slot);
       break;
     case Token::Value::BIT_OR:
       OutputBitwiseOrSmi(literal->value(), feedback_slot);
@@ -571,6 +577,12 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadLiteral(
   return *this;
 }
 
+BytecodeArrayBuilder& BytecodeArrayBuilder::LoadLiteral(double value) {
+  size_t entry = GetConstantPoolEntry(value);
+  OutputLdaConstant(entry);
+  return *this;
+}
+
 BytecodeArrayBuilder& BytecodeArrayBuilder::LoadLiteral(
     const AstRawString* raw_string) {
   size_t entry = GetConstantPoolEntry(raw_string);
@@ -584,39 +596,22 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadLiteral(const Scope* scope) {
   return *this;
 }
 
-BytecodeArrayBuilder& BytecodeArrayBuilder::LoadLiteral(
-    const AstValue* ast_value) {
-  if (ast_value->IsSmi()) {
-    return LoadLiteral(ast_value->AsSmi());
-  } else if (ast_value->IsUndefined()) {
-    return LoadUndefined();
-  } else if (ast_value->IsTrue()) {
-    return LoadTrue();
-  } else if (ast_value->IsFalse()) {
-    return LoadFalse();
-  } else if (ast_value->IsNull()) {
-    return LoadNull();
-  } else if (ast_value->IsTheHole()) {
-    return LoadTheHole();
-  } else if (ast_value->IsString()) {
-    return LoadLiteral(ast_value->AsString());
-  } else if (ast_value->IsHeapNumber() || ast_value->IsBigInt()) {
-    size_t entry = GetConstantPoolEntry(ast_value);
-    OutputLdaConstant(entry);
-    return *this;
-  } else {
-    // This should be the only ast value type left.
-    DCHECK(ast_value->IsSymbol());
-    size_t entry;
-    switch (ast_value->AsSymbol()) {
-      case AstSymbol::kHomeObjectSymbol:
-        entry = HomeObjectSymbolConstantPoolEntry();
-        break;
-        // No default case so that we get a warning if AstSymbol changes
-    }
-    OutputLdaConstant(entry);
-    return *this;
+BytecodeArrayBuilder& BytecodeArrayBuilder::LoadLiteral(AstBigInt bigint) {
+  size_t entry = GetConstantPoolEntry(bigint);
+  OutputLdaConstant(entry);
+  return *this;
+}
+
+BytecodeArrayBuilder& BytecodeArrayBuilder::LoadLiteral(AstSymbol symbol) {
+  size_t entry;
+  switch (symbol) {
+    case AstSymbol::kHomeObjectSymbol:
+      entry = HomeObjectSymbolConstantPoolEntry();
+      break;
+      // No default case so that we get a warning if AstSymbol changes
   }
+  OutputLdaConstant(entry);
+  return *this;
 }
 
 BytecodeArrayBuilder& BytecodeArrayBuilder::LoadUndefined() {
@@ -706,14 +701,9 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::LoadGlobal(const AstRawString* name,
 }
 
 BytecodeArrayBuilder& BytecodeArrayBuilder::StoreGlobal(
-    const AstRawString* name, int feedback_slot, LanguageMode language_mode) {
+    const AstRawString* name, int feedback_slot) {
   size_t name_index = GetConstantPoolEntry(name);
-  if (language_mode == LanguageMode::kSloppy) {
-    OutputStaGlobalSloppy(name_index, feedback_slot);
-  } else {
-    DCHECK_EQ(language_mode, LanguageMode::kStrict);
-    OutputStaGlobalStrict(name_index, feedback_slot);
-  }
+  OutputStaGlobal(name_index, feedback_slot);
   return *this;
 }
 
@@ -878,6 +868,20 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::StoreHomeObjectProperty(
     Register object, int feedback_slot, LanguageMode language_mode) {
   size_t name_index = HomeObjectSymbolConstantPoolEntry();
   return StoreNamedProperty(object, name_index, feedback_slot, language_mode);
+}
+
+BytecodeArrayBuilder& BytecodeArrayBuilder::StoreClassFieldsInitializer(
+    Register constructor, int feedback_slot) {
+  size_t name_index = ClassFieldsSymbolConstantPoolEntry();
+  return StoreNamedProperty(constructor, name_index, feedback_slot,
+                            LanguageMode::kStrict);
+}
+
+BytecodeArrayBuilder& BytecodeArrayBuilder::LoadClassFieldsInitializer(
+    Register constructor, int feedback_slot) {
+  size_t name_index = ClassFieldsSymbolConstantPoolEntry();
+  OutputLdaNamedProperty(constructor, name_index, feedback_slot);
+  return *this;
 }
 
 BytecodeArrayBuilder& BytecodeArrayBuilder::CreateClosure(
@@ -1176,8 +1180,10 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::ReThrow() {
   return *this;
 }
 
-BytecodeArrayBuilder& BytecodeArrayBuilder::Abort(BailoutReason reason) {
-  OutputAbort(reason);
+BytecodeArrayBuilder& BytecodeArrayBuilder::Abort(AbortReason reason) {
+  DCHECK_LT(reason, AbortReason::kLastErrorMessage);
+  DCHECK_GE(reason, AbortReason::kNoReason);
+  OutputAbort(static_cast<int>(reason));
   return *this;
 }
 
@@ -1271,10 +1277,10 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::RestoreGeneratorState(
   return *this;
 }
 
-BytecodeArrayBuilder& BytecodeArrayBuilder::RestoreGeneratorRegisters(
-    Register generator, RegisterList registers) {
-  OutputRestoreGeneratorRegisters(generator, registers,
-                                  registers.register_count());
+BytecodeArrayBuilder& BytecodeArrayBuilder::ResumeGenerator(
+    Register generator, Register generator_state, RegisterList registers) {
+  OutputResumeGenerator(generator, generator_state, registers,
+                        registers.register_count());
   return *this;
 }
 
@@ -1380,7 +1386,7 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::CallRuntime(
 
 BytecodeArrayBuilder& BytecodeArrayBuilder::CallRuntime(
     Runtime::FunctionId function_id, Register arg) {
-  return CallRuntime(function_id, RegisterList(arg.index(), 1));
+  return CallRuntime(function_id, RegisterList(arg));
 }
 
 BytecodeArrayBuilder& BytecodeArrayBuilder::CallRuntime(
@@ -1402,8 +1408,7 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::CallRuntimeForPair(
 
 BytecodeArrayBuilder& BytecodeArrayBuilder::CallRuntimeForPair(
     Runtime::FunctionId function_id, Register arg, RegisterList return_pair) {
-  return CallRuntimeForPair(function_id, RegisterList(arg.index(), 1),
-                            return_pair);
+  return CallRuntimeForPair(function_id, RegisterList(arg), return_pair);
 }
 
 BytecodeArrayBuilder& BytecodeArrayBuilder::CallJSRuntime(int context_index,
@@ -1428,13 +1433,16 @@ size_t BytecodeArrayBuilder::GetConstantPoolEntry(
   return constant_array_builder()->Insert(raw_string);
 }
 
-size_t BytecodeArrayBuilder::GetConstantPoolEntry(const AstValue* heap_number) {
-  DCHECK(heap_number->IsHeapNumber() || heap_number->IsBigInt());
-  return constant_array_builder()->Insert(heap_number);
+size_t BytecodeArrayBuilder::GetConstantPoolEntry(AstBigInt bigint) {
+  return constant_array_builder()->Insert(bigint);
 }
 
 size_t BytecodeArrayBuilder::GetConstantPoolEntry(const Scope* scope) {
   return constant_array_builder()->Insert(scope);
+}
+
+size_t BytecodeArrayBuilder::GetConstantPoolEntry(double number) {
+  return constant_array_builder()->Insert(number);
 }
 
 #define ENTRY_GETTER(NAME, ...)                            \

@@ -30,10 +30,11 @@ class Log {
   void stop() { is_stopped_ = true; }
 
   static bool InitLogAtStart() {
-    return FLAG_log || FLAG_log_api || FLAG_log_code || FLAG_log_gc ||
-           FLAG_log_handles || FLAG_log_suspect || FLAG_ll_prof ||
-           FLAG_perf_basic_prof || FLAG_perf_prof || FLAG_log_source_code ||
-           FLAG_log_internal_timer_events || FLAG_prof_cpp || FLAG_trace_ic;
+    return FLAG_log || FLAG_log_api || FLAG_log_code || FLAG_log_handles ||
+           FLAG_log_suspect || FLAG_ll_prof || FLAG_perf_basic_prof ||
+           FLAG_perf_prof || FLAG_log_source_code ||
+           FLAG_log_internal_timer_events || FLAG_prof_cpp || FLAG_trace_ic ||
+           FLAG_log_function_events;
   }
 
   // Frees all resources acquired in Initialize and Open... functions.
@@ -67,12 +68,6 @@ class Log {
     // Append string data to the log message.
     void PRINTF_FORMAT(2, 0) AppendVA(const char* format, va_list args);
 
-    // Append a heap string.
-    void Append(String* str);
-
-    // Appends an address.
-    void AppendAddress(Address addr);
-
     void AppendSymbolName(Symbol* symbol);
 
     void AppendDetailed(String* str, bool show_impl_info);
@@ -83,7 +78,7 @@ class Log {
 
     // Append and escpae a portion of a string.
     void AppendStringPart(String* source, int len);
-    void AppendStringPart(const char* str, int len);
+    void AppendStringPart(const char* str, size_t len);
 
     void AppendCharacter(const char character);
 
@@ -138,6 +133,8 @@ class Log {
 template <>
 Log::MessageBuilder& Log::MessageBuilder::operator<<<LogSeparator>(
     LogSeparator separator);
+template <>
+Log::MessageBuilder& Log::MessageBuilder::operator<<<void*>(void* pointer);
 template <>
 Log::MessageBuilder& Log::MessageBuilder::operator<<<const char*>(
     const char* string);

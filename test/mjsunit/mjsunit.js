@@ -132,9 +132,8 @@ var assertContains;
 // Assert that a string matches a given regex.
 var assertMatches;
 
-// Assert the fulfillment or rejection of a promise.
-var assertPromiseFulfills;
-var assertPromiseRejects;
+// Assert the result of a promise.
+var assertPromiseResult;
 
 var promiseTestChain;
 var promiseTestCount = 0;
@@ -193,6 +192,12 @@ var failWithMessage;
   var ArrayPrototypeMap = Array.prototype.map;
   var ArrayPrototypePush = Array.prototype.push;
 
+  var BigIntPrototypeValueOf;
+  // TODO(neis): Remove try-catch once BigInts are enabled by default.
+  try {
+    BigIntPrototypeValueOf = BigInt.prototype.valueOf;
+  } catch(e) {}
+
   function classOf(object) {
     // Argument must not be null or undefined.
     var string = ObjectPrototypeToString.call(object);
@@ -205,6 +210,8 @@ var failWithMessage;
     switch (classOf(value)) {
       case "Number":
         return NumberPrototypeValueOf.call(value);
+      case "BigInt":
+        return BigIntPrototypeValueOf.call(value);
       case "String":
         return StringPrototypeValueOf.call(value);
       case "Boolean":
@@ -221,6 +228,8 @@ var failWithMessage;
     switch (typeof value) {
       case "string":
         return JSON.stringify(value);
+      case "bigint":
+        return String(value) + "n";
       case "number":
         if (value === 0 && (1 / value) < 0) return "-0";
         // FALLTHROUGH.
@@ -234,6 +243,7 @@ var failWithMessage;
         var objectClass = classOf(value);
         switch (objectClass) {
           case "Number":
+          case "BigInt":
           case "String":
           case "Boolean":
           case "Date":
@@ -347,7 +357,8 @@ var failWithMessage;
       return true;
     }
     if (objectClass === "String" || objectClass === "Number" ||
-      objectClass === "Boolean" || objectClass === "Date") {
+      objectClass === "BigInt" || objectClass === "Boolean" ||
+      objectClass === "Date") {
       if (ValueOf(a) !== ValueOf(b)) return false;
     }
     return deepObjectEquals(a, b);
@@ -531,40 +542,42 @@ var failWithMessage;
     }
   };
 
-  assertPromiseFulfills = (promise) => {
-    // waitUntilDone is idempotent.
-    testRunner.waitUntilDone();
-    ++promiseTestCount;
-    return promise.then((value) => {
-      if (--promiseTestCount == 0) {
-        testRunner.notifyDone();
-      }
-      return value;
-    }).catch((error) => {
-      // Use `setTimeout` to cause the assert to trigger outside of the promise,
-      // since promises swallow exceptions.
-      setTimeout(() => {
-        assertUnreachable("Promise was rejected unexpectedly");
-      });
-    });
-  };
+  assertPromiseResult = function(promise, success, fail) {
+    // Use --allow-natives-syntax to use this function. Note that this function
+    // overwrites {failWithMessage} permanently with %AbortJS.
 
-  assertPromiseRejects = (promise) => {
+    // We have to patch mjsunit because normal assertion failures just throw
+    // exceptions which are swallowed in a then clause.
+    // We use eval here to avoid parsing issues with the natives syntax.
+    if (!success) success = () => {};
+
+    failWithMessage = (msg) => eval("%AbortJS(msg)");
+    if (!fail) {
+      fail = result => failWithMessage("assertPromiseResult failed: " + result);
+    }
+
+    var test_promise =
+        promise.then(
+          result => {
+            try {
+              success(result);
+            } catch (e) {
+              failWithMessage(String(e));
+            }
+          },
+          result => {
+            fail(result);
+          }
+        )
+        .then((x)=> {
+          if (--promiseTestCount == 0) testRunner.notifyDone();
+        });
+
+    if (!promiseTestChain) promiseTestChain = Promise.resolve();
     // waitUntilDone is idempotent.
     testRunner.waitUntilDone();
     ++promiseTestCount;
-    return promise.then(() => {
-      // Use `setTimeout` to cause the assert to trigger outside of the promise,
-      // since promises swallow exceptions.
-      setTimeout(() => {
-        assertUnreachable("Promise was fulfilled unexpectedly");
-      });
-    }).catch((error) => {
-      if (--promiseTestCount == 0) {
-        testRunner.notifyDone();
-      }
-      return error;
-    });
+    return promiseTestChain.then(test_promise);
   };
 
   var OptimizationStatusImpl = undefined;

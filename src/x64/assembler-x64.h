@@ -84,19 +84,6 @@ namespace internal {
 // The length of pushq(rbp), movp(rbp, rsp), Push(rsi) and Push(rdi).
 constexpr int kNoCodeAgeSequenceLength = kPointerSize == kInt64Size ? 6 : 17;
 
-const int kNumRegs = 16;
-const RegList kJSCallerSaved =
-    1 << 0 |  // rax
-    1 << 1 |  // rcx
-    1 << 2 |  // rdx
-    1 << 3 |  // rbx - used as a caller-saved register in JavaScript code
-    1 << 7;   // rdi - callee function
-
-const int kNumJSCallerSaved = 5;
-
-// Number of registers for which space is reserved in safepoints.
-const int kNumSafepointRegisters = 16;
-
 enum RegisterCode {
 #define REGISTER_CODE(R) kRegCode_##R,
   GENERAL_REGISTERS(REGISTER_CODE)
@@ -128,6 +115,19 @@ static_assert(IS_TRIVIALLY_COPYABLE(Register) &&
 GENERAL_REGISTERS(DECLARE_REGISTER)
 #undef DECLARE_REGISTER
 constexpr Register no_reg = Register::no_reg();
+
+constexpr int kNumRegs = 16;
+
+constexpr RegList kJSCallerSaved =
+    Register::ListOf<rax, rcx, rdx,
+                     rbx,  // used as a caller-saved register in JavaScript code
+                     rdi   // callee function
+                     >();
+
+constexpr int kNumJSCallerSaved = 5;
+
+// Number of registers for which space is reserved in safepoints.
+constexpr int kNumSafepointRegisters = 16;
 
 #ifdef _WIN64
   // Windows calling convention
@@ -182,6 +182,7 @@ constexpr Register arg_reg_4 = rcx;
   V(xmm13)                              \
   V(xmm14)
 
+constexpr bool kPadArguments = false;
 constexpr bool kSimpleFPAliasing = true;
 constexpr bool kSimdMaskRegisters = false;
 
@@ -476,10 +477,6 @@ class Assembler : public AssemblerBase {
   static inline Address target_address_at(Address pc, Address constant_pool);
   static inline void set_target_address_at(
       Isolate* isolate, Address pc, Address constant_pool, Address target,
-      ICacheFlushMode icache_flush_mode = FLUSH_ICACHE_IF_NEEDED);
-  static inline Address target_address_at(Address pc, Code* code);
-  static inline void set_target_address_at(
-      Isolate* isolate, Address pc, Code* code, Address target,
       ICacheFlushMode icache_flush_mode = FLUSH_ICACHE_IF_NEEDED);
 
   // Return the code target address at a call site from the return address
@@ -885,6 +882,8 @@ class Assembler : public AssemblerBase {
   // Call near relative 32-bit displacement, relative to next instruction.
   void call(Label* L);
   void call(Address entry, RelocInfo::Mode rmode);
+  void near_call(Address entry, RelocInfo::Mode rmode);
+  void near_jmp(Address entry, RelocInfo::Mode rmode);
   void call(CodeStub* stub);
   void call(Handle<Code> target,
             RelocInfo::Mode rmode = RelocInfo::CODE_TARGET);
@@ -1209,6 +1208,9 @@ class Assembler : public AssemblerBase {
   void xorpd(XMMRegister dst, const Operand& src);
   void sqrtsd(XMMRegister dst, XMMRegister src);
   void sqrtsd(XMMRegister dst, const Operand& src);
+
+  void haddps(XMMRegister dst, XMMRegister src);
+  void haddps(XMMRegister dst, const Operand& src);
 
   void ucomisd(XMMRegister dst, XMMRegister src);
   void ucomisd(XMMRegister dst, const Operand& src);
@@ -1903,6 +1905,9 @@ class Assembler : public AssemblerBase {
   void rorxl(Register dst, Register src, byte imm8);
   void rorxl(Register dst, const Operand& src, byte imm8);
 
+  void lfence();
+  void pause();
+
   // Check the code size generated from label to here.
   int SizeOfCodeGeneratedSince(Label* label) {
     return pc_offset() - label->pos();
@@ -1923,8 +1928,6 @@ class Assembler : public AssemblerBase {
     // No embedded constant pool support.
     UNREACHABLE();
   }
-
-  void RecordProtectedInstructionLanding(int pc_offset);
 
   // Writes a single word of data in the code stream.
   // Used for inline tables, e.g., jump-tables.

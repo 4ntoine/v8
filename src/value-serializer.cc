@@ -21,6 +21,7 @@
 #include "src/wasm/module-compiler.h"
 #include "src/wasm/wasm-objects-inl.h"
 #include "src/wasm/wasm-result.h"
+#include "src/wasm/wasm-serialization.h"
 
 namespace v8 {
 namespace internal {
@@ -213,11 +214,11 @@ void ValueSerializer::WriteVarint(T value) {
   uint8_t stack_buffer[sizeof(T) * 8 / 7 + 1];
   uint8_t* next_byte = &stack_buffer[0];
   do {
-    *next_byte = (value & 0x7f) | 0x80;
+    *next_byte = (value & 0x7F) | 0x80;
     next_byte++;
     value >>= 7;
   } while (value);
-  *(next_byte - 1) &= 0x7f;
+  *(next_byte - 1) &= 0x7F;
   WriteRawBytes(stack_buffer, next_byte - stack_buffer);
 }
 
@@ -847,7 +848,7 @@ Maybe<bool> ValueSerializer::WriteWasmModule(Handle<WasmModuleObject> object) {
   WriteTag(SerializationTag::kWasmModule);
   WriteRawBytes(&encoding_tag, sizeof(encoding_tag));
 
-  Handle<String> wire_bytes(compiled_part->module_bytes(), isolate_);
+  Handle<String> wire_bytes(compiled_part->shared()->module_bytes(), isolate_);
   int wire_bytes_length = wire_bytes->length();
   WriteVarint<uint32_t>(wire_bytes_length);
   uint8_t* destination;
@@ -855,13 +856,10 @@ Maybe<bool> ValueSerializer::WriteWasmModule(Handle<WasmModuleObject> object) {
     String::WriteToFlat(*wire_bytes, destination, 0, wire_bytes_length);
   }
 
-  std::unique_ptr<ScriptData> script_data =
-      WasmCompiledModuleSerializer::SerializeWasmModule(isolate_,
-                                                        compiled_part);
-  int script_data_length = script_data->length();
-  WriteVarint<uint32_t>(script_data_length);
-  WriteRawBytes(script_data->data(), script_data_length);
-
+  std::pair<std::unique_ptr<const byte[]>, size_t> serialized_module =
+      wasm::SerializeNativeModule(isolate_, compiled_part);
+  WriteVarint<uint32_t>(static_cast<uint32_t>(serialized_module.second));
+  WriteRawBytes(serialized_module.first.get(), serialized_module.second);
   return ThrowIfOutOfMemory();
 }
 
@@ -1024,7 +1022,7 @@ Maybe<T> ValueDeserializer::ReadVarint() {
     if (position_ >= end_) return Nothing<T>();
     uint8_t byte = *position_;
     if (V8_LIKELY(shift < sizeof(T) * 8)) {
-      value |= static_cast<T>(byte & 0x7f) << shift;
+      value |= static_cast<T>(byte & 0x7F) << shift;
       shift += 7;
     }
     has_another_byte = byte & 0x80;
@@ -1086,13 +1084,13 @@ bool ValueDeserializer::ReadRawBytes(size_t length, const void** data) {
 void ValueDeserializer::TransferArrayBuffer(
     uint32_t transfer_id, Handle<JSArrayBuffer> array_buffer) {
   if (array_buffer_transfer_map_.is_null()) {
-    array_buffer_transfer_map_ = isolate_->global_handles()->Create(
-        *UnseededNumberDictionary::New(isolate_, 0));
+    array_buffer_transfer_map_ =
+        isolate_->global_handles()->Create(*NumberDictionary::New(isolate_, 0));
   }
-  Handle<UnseededNumberDictionary> dictionary =
+  Handle<NumberDictionary> dictionary =
       array_buffer_transfer_map_.ToHandleChecked();
-  Handle<UnseededNumberDictionary> new_dictionary =
-      UnseededNumberDictionary::Set(dictionary, transfer_id, array_buffer);
+  Handle<NumberDictionary> new_dictionary =
+      NumberDictionary::Set(dictionary, transfer_id, array_buffer);
   if (!new_dictionary.is_identical_to(dictionary)) {
     GlobalHandles::Destroy(Handle<Object>::cast(dictionary).location());
     array_buffer_transfer_map_ =
@@ -1488,11 +1486,8 @@ MaybeHandle<JSRegExp> ValueDeserializer::ReadJSRegExp() {
     return MaybeHandle<JSRegExp>();
   }
 
-  // Ensure the deserialized flags are valid. The context behind this is that
-  // the JSRegExp::Flags enum statically includes kDotAll, but it is only valid
-  // to set kDotAll if FLAG_harmony_regexp_dotall is enabled. Fuzzers don't
-  // know about this and happily set kDotAll anyways, leading to CHECK failures
-  // later on.
+  // Ensure the deserialized flags are valid.
+  // TODO(adamk): Can we remove this check now that dotAll is always-on?
   uint32_t flags_mask = static_cast<uint32_t>(-1) << JSRegExp::FlagCount();
   if ((raw_flags & flags_mask) ||
       !JSRegExp::New(pattern, static_cast<JSRegExp::Flags>(raw_flags))
@@ -1601,13 +1596,13 @@ MaybeHandle<JSArrayBuffer> ValueDeserializer::ReadTransferredJSArrayBuffer(
     bool is_shared) {
   uint32_t id = next_id_++;
   uint32_t transfer_id;
-  Handle<UnseededNumberDictionary> transfer_map;
+  Handle<NumberDictionary> transfer_map;
   if (!ReadVarint<uint32_t>().To(&transfer_id) ||
       !array_buffer_transfer_map_.ToHandle(&transfer_map)) {
     return MaybeHandle<JSArrayBuffer>();
   }
   int index = transfer_map->FindEntry(isolate_, transfer_id);
-  if (index == UnseededNumberDictionary::kNotFound) {
+  if (index == NumberDictionary::kNotFound) {
     return MaybeHandle<JSArrayBuffer>();
   }
   Handle<JSArrayBuffer> array_buffer(
@@ -1711,15 +1706,13 @@ MaybeHandle<JSObject> ValueDeserializer::ReadWasmModule() {
   }
 
   // Try to deserialize the compiled module first.
-  ScriptData script_data(compiled_bytes.start(), compiled_bytes.length());
-  Handle<FixedArray> compiled_part;
+  Handle<WasmCompiledModule> compiled_module;
   MaybeHandle<JSObject> result;
-  if (WasmCompiledModuleSerializer::DeserializeWasmModule(
-          isolate_, &script_data, wire_bytes)
-          .ToHandle(&compiled_part)) {
-    result = WasmModuleObject::New(
-        isolate_, Handle<WasmCompiledModule>::cast(compiled_part));
-  } else {
+  if (wasm::DeserializeNativeModule(isolate_, compiled_bytes, wire_bytes)
+          .ToHandle(&compiled_module)) {
+    result = WasmModuleObject::New(isolate_, compiled_module);
+  }
+  if (result.is_null()) {
     wasm::ErrorThrower thrower(isolate_, "ValueDeserializer::ReadWasmModule");
     result = wasm::SyncCompile(isolate_, &thrower,
                                wasm::ModuleWireBytes(wire_bytes));

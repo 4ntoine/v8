@@ -94,7 +94,7 @@ class SnapshotWriter {
   static void WriteSnapshotData(FILE* fp,
                                 const i::Vector<const i::byte>& blob) {
     for (int i = 0; i < blob.length(); i++) {
-      if ((i & 0x1f) == 0x1f) fprintf(fp, "\n");
+      if ((i & 0x1F) == 0x1F) fprintf(fp, "\n");
       if (i > 0) fprintf(fp, ",");
       fprintf(fp, "%u", static_cast<unsigned char>(blob.at(i)));
     }
@@ -156,8 +156,8 @@ int main(int argc, char** argv) {
 
   i::CpuFeatures::Probe(true);
   v8::V8::InitializeICUDefaultLocation(argv[0]);
-  v8::Platform* platform = v8::platform::CreateDefaultPlatform();
-  v8::V8::InitializePlatform(platform);
+  std::unique_ptr<v8::Platform> platform = v8::platform::NewDefaultPlatform();
+  v8::V8::InitializePlatform(platform.get());
   v8::V8::Initialize();
 
   {
@@ -186,6 +186,5 @@ int main(int argc, char** argv) {
 
   v8::V8::Dispose();
   v8::V8::ShutdownPlatform();
-  delete platform;
   return 0;
 }

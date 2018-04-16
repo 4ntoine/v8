@@ -57,7 +57,7 @@ Node* AsyncBuiltinsAssembler::Await(
       LoadObjectField(promise_fun, JSFunction::kPrototypeOrInitialMapOffset);
   // Assert that the JSPromise map has an instance size is
   // JSPromise::kSizeWithEmbedderFields.
-  CSA_ASSERT(this, WordEqual(LoadMapInstanceSize(promise_map),
+  CSA_ASSERT(this, WordEqual(LoadMapInstanceSizeInWords(promise_map),
                              IntPtrConstant(JSPromise::kSizeWithEmbedderFields /
                                             kPointerSize)));
   Node* const wrapped_value = InnerAllocate(base, kWrappedPromiseOffset);
@@ -66,8 +66,7 @@ Node* AsyncBuiltinsAssembler::Await(
     StoreMapNoWriteBarrier(wrapped_value, promise_map);
     InitializeJSObjectFromMap(
         wrapped_value, promise_map,
-        IntPtrConstant(JSPromise::kSizeWithEmbedderFields),
-        EmptyFixedArrayConstant(), EmptyFixedArrayConstant());
+        IntPtrConstant(JSPromise::kSizeWithEmbedderFields));
     PromiseInit(wrapped_value);
   }
 
@@ -77,8 +76,7 @@ Node* AsyncBuiltinsAssembler::Await(
     StoreMapNoWriteBarrier(throwaway, promise_map);
     InitializeJSObjectFromMap(
         throwaway, promise_map,
-        IntPtrConstant(JSPromise::kSizeWithEmbedderFields),
-        EmptyFixedArrayConstant(), EmptyFixedArrayConstant());
+        IntPtrConstant(JSPromise::kSizeWithEmbedderFields));
     PromiseInit(throwaway);
   }
 
@@ -126,8 +124,7 @@ Node* AsyncBuiltinsAssembler::Await(
       Node* const key =
           HeapConstant(factory()->promise_forwarding_handler_symbol());
       CallRuntime(Runtime::kSetProperty, context, on_reject, key,
-                  TrueConstant(),
-                  SmiConstant(Smi::FromEnum(LanguageMode::kStrict)));
+                  TrueConstant(), SmiConstant(LanguageMode::kStrict));
 
       GotoIf(IsFalse(is_predicted_as_caught), &common);
       PromiseSetHandledHint(value);
@@ -141,7 +138,7 @@ Node* AsyncBuiltinsAssembler::Await(
 
     Node* const key = HeapConstant(factory()->promise_handled_by_symbol());
     CallRuntime(Runtime::kSetProperty, context, throwaway, key, outer_promise,
-                SmiConstant(Smi::FromEnum(LanguageMode::kStrict)));
+                SmiConstant(LanguageMode::kStrict));
   }
 
   Goto(&do_perform_promise_then);
@@ -161,9 +158,10 @@ void AsyncBuiltinsAssembler::InitializeNativeClosure(Node* context,
       native_context, Context::STRICT_FUNCTION_WITHOUT_PROTOTYPE_MAP_INDEX);
   // Ensure that we don't have to initialize prototype_or_initial_map field of
   // JSFunction.
-  CSA_ASSERT(this, WordEqual(LoadMapInstanceSize(function_map),
+  CSA_ASSERT(this, WordEqual(LoadMapInstanceSizeInWords(function_map),
                              IntPtrConstant(JSFunction::kSizeWithoutPrototype /
                                             kPointerSize)));
+  STATIC_ASSERT(JSFunction::kSizeWithoutPrototype == 7 * kPointerSize);
   StoreMapNoWriteBarrier(function, function_map);
   StoreObjectFieldRoot(function, JSObject::kPropertiesOrHashOffset,
                        Heap::kEmptyFixedArrayRootIndex);

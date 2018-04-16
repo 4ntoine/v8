@@ -43,7 +43,7 @@ uint8_t CreateClosureFlags::Encode(bool pretenure, bool is_function_scope) {
 // static
 TestTypeOfFlags::LiteralFlag TestTypeOfFlags::GetFlagForLiteral(
     const AstStringConstants* ast_constants, Literal* literal) {
-  const AstRawString* raw_literal = literal->raw_value()->AsString();
+  const AstRawString* raw_literal = literal->AsRawString();
   if (raw_literal == ast_constants->number_string()) {
     return LiteralFlag::kNumber;
   } else if (raw_literal == ast_constants->string_string()) {
@@ -52,6 +52,8 @@ TestTypeOfFlags::LiteralFlag TestTypeOfFlags::GetFlagForLiteral(
     return LiteralFlag::kSymbol;
   } else if (raw_literal == ast_constants->boolean_string()) {
     return LiteralFlag::kBoolean;
+  } else if (raw_literal == ast_constants->bigint_string()) {
+    return LiteralFlag::kBigInt;
   } else if (raw_literal == ast_constants->undefined_string()) {
     return LiteralFlag::kUndefined;
   } else if (raw_literal == ast_constants->function_string()) {

@@ -45,7 +45,13 @@ ParseInfo::ParseInfo(Handle<SharedFunctionInfo> shared)
   Isolate* isolate = shared->GetIsolate();
   InitFromIsolate(isolate);
 
+  // Do not support re-parsing top-level function of a wrapped script.
+  // TODO(yangguo): consider whether we need a top-level function in a
+  //                wrapped script at all.
+  DCHECK_IMPLIES(is_toplevel(), !Script::cast(shared->script())->is_wrapped());
+
   set_toplevel(shared->is_toplevel());
+  set_wrapped_as_function(shared->is_wrapped());
   set_allow_lazy_parsing(FLAG_lazy_inner_functions);
   set_is_named_expression(shared->is_named_expression());
   set_compiler_hints(shared->compiler_hints());
@@ -88,6 +94,7 @@ ParseInfo::ParseInfo(Handle<Script> script)
   set_allow_lazy_parsing();
   set_toplevel();
   set_script(script);
+  set_wrapped_as_function(script->is_wrapped());
 
   set_native(script->type() == Script::TYPE_NATIVE);
   set_eval(script->compilation_type() == Script::COMPILATION_TYPE_EVAL);
@@ -149,18 +156,38 @@ FunctionKind ParseInfo::function_kind() const {
   return SharedFunctionInfo::FunctionKindBits::decode(compiler_hints_);
 }
 
+bool ParseInfo::requires_instance_fields_initializer() const {
+  return SharedFunctionInfo::RequiresInstanceFieldsInitializer::decode(
+      compiler_hints_);
+}
+
 void ParseInfo::InitFromIsolate(Isolate* isolate) {
   DCHECK_NOT_NULL(isolate);
   set_hash_seed(isolate->heap()->HashSeed());
   set_stack_limit(isolate->stack_guard()->real_climit());
   set_unicode_cache(isolate->unicode_cache());
   set_runtime_call_stats(isolate->counters()->runtime_call_stats());
+  set_logger(isolate->logger());
   set_ast_string_constants(isolate->ast_string_constants());
   if (isolate->is_block_code_coverage()) set_block_coverage_enabled();
   if (isolate->is_collecting_type_profile()) set_collect_type_profile();
 }
 
-void ParseInfo::UpdateStatisticsAfterBackgroundParse(Isolate* isolate) {
+void ParseInfo::EmitBackgroundParseStatisticsOnBackgroundThread() {
+  // If runtime call stats was enabled by tracing, emit a trace event at the
+  // end of background parsing on the background thread.
+  if (runtime_call_stats_ &&
+      (FLAG_runtime_stats &
+       v8::tracing::TracingCategoryObserver::ENABLED_BY_TRACING)) {
+    auto value = v8::tracing::TracedValue::Create();
+    runtime_call_stats_->Dump(value.get());
+    TRACE_EVENT_INSTANT1(TRACE_DISABLED_BY_DEFAULT("v8.runtime_stats"),
+                         "V8.RuntimeStats", TRACE_EVENT_SCOPE_THREAD,
+                         "runtime-call-stats", std::move(value));
+  }
+}
+
+void ParseInfo::UpdateBackgroundParseStatisticsOnMainThread(Isolate* isolate) {
   // Copy over the counters from the background thread to the main counters on
   // the isolate.
   RuntimeCallStats* main_call_stats = isolate->counters()->runtime_call_stats();

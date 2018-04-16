@@ -41,10 +41,6 @@
 #include "src/utils.h"
 #include "src/v8.h"
 
-#if defined(LEAK_SANITIZER)
-#include <sanitizer/lsan_interface.h>
-#endif
-
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <unistd.h>  // NOLINT
 #else
@@ -66,135 +62,128 @@ namespace v8 {
 
 namespace {
 
-const int MB = 1024 * 1024;
+const int kMB = 1024 * 1024;
+
 const int kMaxWorkers = 50;
-const int kMaxSerializerMemoryUsage = 1 * MB;  // Arbitrary maximum for testing.
+const int kMaxSerializerMemoryUsage =
+    1 * kMB;  // Arbitrary maximum for testing.
 
-#define USE_VM 1
-#define VM_THRESHOLD 65536
-// TODO(titzer): allocations should fail if >= 2gb because of
-// array buffers storing the lengths as a SMI internally.
-#define TWO_GB (2u * 1024u * 1024u * 1024u)
-
-// Forwards memory reservation and protection functions to the V8 default
-// allocator. Used by ShellArrayBufferAllocator and MockArrayBufferAllocator.
+// Base class for shell ArrayBuffer allocators. It forwards all opertions to
+// the default v8 allocator.
 class ArrayBufferAllocatorBase : public v8::ArrayBuffer::Allocator {
-  std::unique_ptr<Allocator> allocator_ =
-      std::unique_ptr<Allocator>(NewDefaultAllocator());
-
  public:
+  void* Allocate(size_t length) override {
+    return allocator_->Allocate(length);
+  }
+
+  void* AllocateUninitialized(size_t length) override {
+    return allocator_->AllocateUninitialized(length);
+  }
+
+  void Free(void* data, size_t length) override {
+    allocator_->Free(data, length);
+  }
+
   void* Reserve(size_t length) override { return allocator_->Reserve(length); }
 
-  void Free(void*, size_t) override = 0;
-
   void Free(void* data, size_t length, AllocationMode mode) override {
-    switch (mode) {
-      case AllocationMode::kNormal: {
-        return Free(data, length);
-      }
-      case AllocationMode::kReservation: {
-        return allocator_->Free(data, length, mode);
-      }
-    }
+    allocator_->Free(data, length, mode);
   }
 
   void SetProtection(void* data, size_t length,
                      Protection protection) override {
     allocator_->SetProtection(data, length, protection);
   }
+
+ private:
+  std::unique_ptr<Allocator> allocator_ =
+      std::unique_ptr<Allocator>(NewDefaultAllocator());
 };
 
+// ArrayBuffer allocator that can use virtual memory to improve performance.
 class ShellArrayBufferAllocator : public ArrayBufferAllocatorBase {
  public:
   void* Allocate(size_t length) override {
-#if USE_VM
-    if (RoundToPageSize(&length)) {
-      void* data = VirtualMemoryAllocate(length);
-#if DEBUG
-      if (data) {
-        // In debug mode, check the memory is zero-initialized.
-        size_t limit = length / sizeof(uint64_t);
-        uint64_t* ptr = reinterpret_cast<uint64_t*>(data);
-        for (size_t i = 0; i < limit; i++) {
-          DCHECK_EQ(0u, ptr[i]);
-        }
-      }
-#endif
-      return data;
-    }
-#endif
-    void* data = AllocateUninitialized(length);
-    return data == nullptr ? data : memset(data, 0, length);
+    if (length >= kVMThreshold) return AllocateVM(length);
+    return ArrayBufferAllocatorBase::Allocate(length);
   }
+
   void* AllocateUninitialized(size_t length) override {
-#if USE_VM
-    if (RoundToPageSize(&length)) return VirtualMemoryAllocate(length);
-#endif
-// Work around for GCC bug on AIX
-// See: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=79839
-#if V8_OS_AIX && _LINUX_SOURCE_COMPAT
-    return __linux_malloc(length);
-#else
-    return malloc(length);
-#endif
+    if (length >= kVMThreshold) return AllocateVM(length);
+    return ArrayBufferAllocatorBase::AllocateUninitialized(length);
   }
-  using ArrayBufferAllocatorBase::Free;
+
   void Free(void* data, size_t length) override {
-#if USE_VM
-    if (RoundToPageSize(&length)) {
-      base::OS::ReleaseRegion(data, length);
-      return;
+    if (length >= kVMThreshold) {
+      FreeVM(data, length);
+    } else {
+      ArrayBufferAllocatorBase::Free(data, length);
     }
-#endif
-    free(data);
   }
-  // If {length} is at least {VM_THRESHOLD}, round up to next page size
-  // and return {true}. Otherwise return {false}.
-  bool RoundToPageSize(size_t* length) {
-    const size_t kPageSize = base::OS::CommitPageSize();
-    if (*length >= VM_THRESHOLD && *length < TWO_GB) {
-      *length = ((*length + kPageSize - 1) / kPageSize) * kPageSize;
-      return true;
-    }
-    return false;
+
+  void* Reserve(size_t length) override {
+    // |length| must be over the threshold so we can distinguish VM from
+    // malloced memory.
+    DCHECK_LE(kVMThreshold, length);
+    return ArrayBufferAllocatorBase::Reserve(length);
   }
-#if USE_VM
-  void* VirtualMemoryAllocate(size_t length) {
-    void* data = base::OS::ReserveRegion(length, nullptr);
-    if (data && !base::OS::CommitRegion(data, length, false)) {
-      base::OS::ReleaseRegion(data, length);
-      return nullptr;
-    }
-#if defined(LEAK_SANITIZER)
-    __lsan_register_root_region(data, length);
-#endif
-    MSAN_MEMORY_IS_INITIALIZED(data, length);
-    return data;
+
+  void Free(void* data, size_t length, AllocationMode) override {
+    // Ignore allocation mode; the appropriate action is determined by |length|.
+    Free(data, length);
   }
-#endif
+
+ private:
+  static constexpr size_t kVMThreshold = 65536;
+  static constexpr size_t kTwoGB = 2u * 1024u * 1024u * 1024u;
+
+  void* AllocateVM(size_t length) {
+    DCHECK_LE(kVMThreshold, length);
+    // TODO(titzer): allocations should fail if >= 2gb because array buffers
+    // store their lengths as a SMI internally.
+    if (length >= kTwoGB) return nullptr;
+
+    size_t page_size = i::AllocatePageSize();
+    size_t allocated = RoundUp(length, page_size);
+    // Rounding up could go over the limit.
+    if (allocated >= kTwoGB) return nullptr;
+    return i::AllocatePages(nullptr, allocated, page_size,
+                            PageAllocator::kReadWrite);
+  }
+
+  void FreeVM(void* data, size_t length) {
+    size_t page_size = i::AllocatePageSize();
+    size_t allocated = RoundUp(length, page_size);
+    CHECK(i::FreePages(data, allocated));
+  }
 };
 
+// ArrayBuffer allocator that never allocates over 10MB.
 class MockArrayBufferAllocator : public ArrayBufferAllocatorBase {
-  const size_t kAllocationLimit = 10 * MB;
-  size_t get_actual_length(size_t length) const {
-    return length > kAllocationLimit ? base::OS::CommitPageSize() : length;
+  void* Allocate(size_t length) override {
+    return ArrayBufferAllocatorBase::Allocate(Adjust(length));
   }
 
- public:
-  void* Allocate(size_t length) override {
-    const size_t actual_length = get_actual_length(length);
-    void* data = AllocateUninitialized(actual_length);
-    return data == nullptr ? data : memset(data, 0, actual_length);
-  }
   void* AllocateUninitialized(size_t length) override {
-    return malloc(get_actual_length(length));
+    return ArrayBufferAllocatorBase::AllocateUninitialized(Adjust(length));
   }
-  void Free(void* p, size_t) override { free(p); }
-  void Free(void* data, size_t length, AllocationMode mode) override {
-    ArrayBufferAllocatorBase::Free(data, get_actual_length(length), mode);
+
+  void Free(void* data, size_t length) override {
+    return ArrayBufferAllocatorBase::Free(data, Adjust(length));
   }
+
   void* Reserve(size_t length) override {
-    return ArrayBufferAllocatorBase::Reserve(get_actual_length(length));
+    return ArrayBufferAllocatorBase::Reserve(Adjust(length));
+  }
+
+  void Free(void* data, size_t length, AllocationMode mode) override {
+    return ArrayBufferAllocatorBase::Free(data, Adjust(length), mode);
+  }
+
+ private:
+  size_t Adjust(size_t length) {
+    const size_t kAllocationLimit = 10 * kMB;
+    return length > kAllocationLimit ? i::AllocatePageSize() : length;
   }
 };
 
@@ -206,6 +195,30 @@ class PredictablePlatform : public Platform {
   explicit PredictablePlatform(std::unique_ptr<Platform> platform)
       : platform_(std::move(platform)) {
     DCHECK_NOT_NULL(platform_);
+  }
+
+  PageAllocator* GetPageAllocator() override {
+    return platform_->GetPageAllocator();
+  }
+
+  void OnCriticalMemoryPressure() override {
+    platform_->OnCriticalMemoryPressure();
+  }
+
+  bool OnCriticalMemoryPressure(size_t length) override {
+    return platform_->OnCriticalMemoryPressure(length);
+  }
+
+  std::shared_ptr<TaskRunner> GetForegroundTaskRunner(
+      v8::Isolate* isolate) override {
+    return platform_->GetForegroundTaskRunner(isolate);
+  }
+
+  std::shared_ptr<TaskRunner> GetBackgroundTaskRunner(
+      v8::Isolate* isolate) override {
+    // Return the foreground task runner here, so that all tasks get executed
+    // sequentially in a predictable order.
+    return platform_->GetForegroundTaskRunner(isolate);
   }
 
   void CallOnBackgroundThread(Task* task,
@@ -252,12 +265,12 @@ class PredictablePlatform : public Platform {
   DISALLOW_COPY_AND_ASSIGN(PredictablePlatform);
 };
 
-v8::Platform* g_platform = nullptr;
+std::unique_ptr<v8::Platform> g_platform;
 
 v8::Platform* GetDefaultPlatform() {
   return i::FLAG_verify_predictable
-             ? static_cast<PredictablePlatform*>(g_platform)->platform()
-             : g_platform;
+             ? static_cast<PredictablePlatform*>(g_platform.get())->platform()
+             : g_platform.get();
 }
 
 static Local<Value> Throw(Isolate* isolate, const char* message) {
@@ -282,6 +295,13 @@ Worker* GetWorkerFromInternalField(Isolate* isolate, Local<Object> object) {
   return worker;
 }
 
+base::Thread::Options GetThreadOptions(const char* name) {
+  // On some systems (OSX 10.6) the stack size default is 0.5Mb or less
+  // which is not enough to parse the big literal expressions used in tests.
+  // The stack size should be at least StackGuard::kLimitSize + some
+  // OS-specific padding for thread startup code.  2Mbytes seems to be enough.
+  return base::Thread::Options(name, 2 * kMB);
+}
 
 }  // namespace
 
@@ -486,6 +506,9 @@ std::vector<Worker*> Shell::workers_;
 std::vector<ExternalizedContents> Shell::externalized_contents_;
 base::LazyMutex Shell::isolate_status_lock_;
 std::map<v8::Isolate*, bool> Shell::isolate_status_;
+base::LazyMutex Shell::cached_code_mutex_;
+std::map<std::string, std::unique_ptr<ScriptCompiler::CachedData>>
+    Shell::cached_code_map_;
 
 Global<Context> Shell::evaluation_context_;
 ArrayBuffer::Allocator* Shell::array_buffer_allocator;
@@ -498,93 +521,86 @@ bool CounterMap::Match(void* key1, void* key2) {
   return strcmp(name1, name2) == 0;
 }
 
+// Dummy external source stream which returns the whole source in one go.
+class DummySourceStream : public v8::ScriptCompiler::ExternalSourceStream {
+ public:
+  explicit DummySourceStream(Local<String> source) : done_(false) {
+    source_length_ = source->Utf8Length();
+    source_buffer_.reset(new uint8_t[source_length_]);
+    source->WriteUtf8(reinterpret_cast<char*>(source_buffer_.get()),
+                      source_length_);
+  }
 
-ScriptCompiler::CachedData* CompileForCachedData(
-    Local<String> source, Local<Value> name,
-    ScriptCompiler::CompileOptions compile_options) {
-  int source_length = source->Length();
-  uint16_t* source_buffer = new uint16_t[source_length];
-  source->Write(source_buffer, 0, source_length);
-  int name_length = 0;
-  uint16_t* name_buffer = nullptr;
-  if (name->IsString()) {
-    Local<String> name_string = Local<String>::Cast(name);
-    name_length = name_string->Length();
-    name_buffer = new uint16_t[name_length];
-    name_string->Write(name_buffer, 0, name_length);
-  }
-  Isolate::CreateParams create_params;
-  create_params.array_buffer_allocator = Shell::array_buffer_allocator;
-  Isolate* temp_isolate = Isolate::New(create_params);
-  temp_isolate->SetHostImportModuleDynamicallyCallback(
-      Shell::HostImportModuleDynamically);
-  temp_isolate->SetHostInitializeImportMetaObjectCallback(
-      Shell::HostInitializeImportMetaObject);
-  ScriptCompiler::CachedData* result = nullptr;
-  {
-    Isolate::Scope isolate_scope(temp_isolate);
-    HandleScope handle_scope(temp_isolate);
-    Context::Scope context_scope(Context::New(temp_isolate));
-    Local<String> source_copy =
-        v8::String::NewFromTwoByte(temp_isolate, source_buffer,
-                                   v8::NewStringType::kNormal, source_length)
-            .ToLocalChecked();
-    Local<Value> name_copy;
-    if (name_buffer) {
-      name_copy =
-          v8::String::NewFromTwoByte(temp_isolate, name_buffer,
-                                     v8::NewStringType::kNormal, name_length)
-              .ToLocalChecked();
-    } else {
-      name_copy = v8::Undefined(temp_isolate);
+  virtual size_t GetMoreData(const uint8_t** src) {
+    if (done_) {
+      return 0;
     }
-    ScriptCompiler::Source script_source(source_copy, ScriptOrigin(name_copy));
-    if (!ScriptCompiler::CompileUnboundScript(temp_isolate, &script_source,
-                                              compile_options)
-             .IsEmpty() &&
-        script_source.GetCachedData()) {
-      int length = script_source.GetCachedData()->length;
-      uint8_t* cache = new uint8_t[length];
-      memcpy(cache, script_source.GetCachedData()->data, length);
-      result = new ScriptCompiler::CachedData(
-          cache, length, ScriptCompiler::CachedData::BufferOwned);
-    }
+    *src = source_buffer_.release();
+    done_ = true;
+
+    return source_length_;
   }
-  temp_isolate->Dispose();
-  delete[] source_buffer;
-  delete[] name_buffer;
-  return result;
+
+ private:
+  int source_length_;
+  std::unique_ptr<uint8_t[]> source_buffer_;
+  bool done_;
+};
+
+class BackgroundCompileThread : public base::Thread {
+ public:
+  BackgroundCompileThread(Isolate* isolate, Local<String> source)
+      : base::Thread(GetThreadOptions("BackgroundCompileThread")),
+        source_(source),
+        streamed_source_(new DummySourceStream(source),
+                         v8::ScriptCompiler::StreamedSource::UTF8),
+        task_(v8::ScriptCompiler::StartStreamingScript(isolate,
+                                                       &streamed_source_)) {}
+
+  void Run() override { task_->Run(); }
+
+  v8::ScriptCompiler::StreamedSource* streamed_source() {
+    return &streamed_source_;
+  }
+
+ private:
+  Local<String> source_;
+  v8::ScriptCompiler::StreamedSource streamed_source_;
+  std::unique_ptr<v8::ScriptCompiler::ScriptStreamingTask> task_;
+};
+
+ScriptCompiler::CachedData* Shell::LookupCodeCache(Isolate* isolate,
+                                                   Local<Value> source) {
+  base::LockGuard<base::Mutex> lock_guard(cached_code_mutex_.Pointer());
+  CHECK(source->IsString());
+  v8::String::Utf8Value key(isolate, source);
+  DCHECK(*key);
+  auto entry = cached_code_map_.find(*key);
+  if (entry != cached_code_map_.end() && entry->second) {
+    int length = entry->second->length;
+    uint8_t* cache = new uint8_t[length];
+    memcpy(cache, entry->second->data, length);
+    ScriptCompiler::CachedData* cached_data = new ScriptCompiler::CachedData(
+        cache, length, ScriptCompiler::CachedData::BufferOwned);
+    return cached_data;
+  }
+  return nullptr;
 }
 
-
-// Compile a string within the current v8 context.
-MaybeLocal<Script> Shell::CompileString(
-    Isolate* isolate, Local<String> source, Local<Value> name,
-    ScriptCompiler::CompileOptions compile_options) {
-  Local<Context> context(isolate->GetCurrentContext());
-  ScriptOrigin origin(name);
-  if (compile_options == ScriptCompiler::kNoCompileOptions) {
-    ScriptCompiler::Source script_source(source, origin);
-    return ScriptCompiler::Compile(context, &script_source, compile_options);
-  }
-
-  ScriptCompiler::CachedData* data =
-      CompileForCachedData(source, name, compile_options);
-  ScriptCompiler::Source cached_source(source, origin, data);
-  if (compile_options == ScriptCompiler::kProduceCodeCache) {
-    compile_options = ScriptCompiler::kConsumeCodeCache;
-  } else if (compile_options == ScriptCompiler::kProduceParserCache) {
-    compile_options = ScriptCompiler::kConsumeParserCache;
-  } else {
-    DCHECK(false);  // A new compile option?
-  }
-  if (data == nullptr) compile_options = ScriptCompiler::kNoCompileOptions;
-  MaybeLocal<Script> result =
-      ScriptCompiler::Compile(context, &cached_source, compile_options);
-  CHECK(data == nullptr || !data->rejected);
-  return result;
+void Shell::StoreInCodeCache(Isolate* isolate, Local<Value> source,
+                             const ScriptCompiler::CachedData* cache_data) {
+  base::LockGuard<base::Mutex> lock_guard(cached_code_mutex_.Pointer());
+  CHECK(source->IsString());
+  if (cache_data == nullptr) return;
+  v8::String::Utf8Value key(isolate, source);
+  DCHECK(*key);
+  int length = cache_data->length;
+  uint8_t* cache = new uint8_t[length];
+  memcpy(cache, cache_data->data, length);
+  cached_code_map_[*key] = std::unique_ptr<ScriptCompiler::CachedData>(
+      new ScriptCompiler::CachedData(cache, length,
+                                     ScriptCompiler::CachedData::BufferOwned));
 }
-
 
 // Executes a string within the current v8 context.
 bool Shell::ExecuteString(Isolate* isolate, Local<String> source,
@@ -595,20 +611,81 @@ bool Shell::ExecuteString(Isolate* isolate, Local<String> source,
   try_catch.SetVerbose(true);
 
   MaybeLocal<Value> maybe_result;
+  bool success = true;
   {
     PerIsolateData* data = PerIsolateData::Get(isolate);
     Local<Context> realm =
         Local<Context>::New(isolate, data->realms_[data->realm_current_]);
     Context::Scope context_scope(realm);
+    MaybeLocal<Script> maybe_script;
+    Local<Context> context(isolate->GetCurrentContext());
+    ScriptOrigin origin(name);
+
+    if (options.compile_options == ScriptCompiler::kConsumeCodeCache ||
+        options.compile_options == ScriptCompiler::kConsumeParserCache) {
+      ScriptCompiler::CachedData* cached_code =
+          LookupCodeCache(isolate, source);
+      if (cached_code != nullptr) {
+        ScriptCompiler::Source script_source(source, origin, cached_code);
+        maybe_script = ScriptCompiler::Compile(context, &script_source,
+                                               options.compile_options);
+        CHECK(!cached_code->rejected);
+      } else {
+        ScriptCompiler::Source script_source(source, origin);
+        maybe_script = ScriptCompiler::Compile(
+            context, &script_source, ScriptCompiler::kNoCompileOptions);
+      }
+    } else if (options.stress_background_compile) {
+      // Start a background thread compiling the script.
+      BackgroundCompileThread background_compile_thread(isolate, source);
+      background_compile_thread.Start();
+
+      // In parallel, compile on the main thread to flush out any data races.
+      {
+        TryCatch ignore_try_catch(isolate);
+        ScriptCompiler::Source script_source(source, origin);
+        USE(ScriptCompiler::Compile(context, &script_source,
+                                    ScriptCompiler::kNoCompileOptions));
+      }
+
+      // Join with background thread and finalize compilation.
+      background_compile_thread.Join();
+      maybe_script = v8::ScriptCompiler::Compile(
+          context, background_compile_thread.streamed_source(), source, origin);
+    } else {
+      ScriptCompiler::Source script_source(source, origin);
+      maybe_script = ScriptCompiler::Compile(context, &script_source,
+                                             options.compile_options);
+      if (options.compile_options == ScriptCompiler::kProduceParserCache) {
+        StoreInCodeCache(isolate, source, script_source.GetCachedData());
+      }
+    }
+
     Local<Script> script;
-    if (!Shell::CompileString(isolate, source, name, options.compile_options)
-             .ToLocal(&script)) {
+    if (!maybe_script.ToLocal(&script)) {
       // Print errors that happened during compilation.
       if (report_exceptions) ReportException(isolate, &try_catch);
       return false;
     }
+
+    if (options.code_cache_options ==
+        ShellOptions::CodeCacheOptions::kProduceCache) {
+      // Serialize and store it in memory for the next execution.
+      ScriptCompiler::CachedData* cached_data =
+          ScriptCompiler::CreateCodeCache(script->GetUnboundScript(), source);
+      StoreInCodeCache(isolate, source, cached_data);
+      delete cached_data;
+    }
     maybe_result = script->Run(realm);
-    EmptyMessageQueues(isolate);
+    if (options.code_cache_options ==
+        ShellOptions::CodeCacheOptions::kProduceCacheAfterExecute) {
+      // Serialize and store it in memory for the next execution.
+      ScriptCompiler::CachedData* cached_data =
+          ScriptCompiler::CreateCodeCache(script->GetUnboundScript(), source);
+      StoreInCodeCache(isolate, source, cached_data);
+      delete cached_data;
+    }
+    if (!EmptyMessageQueues(isolate)) success = false;
     data->realm_current_ = data->realm_switch_;
   }
   Local<Value> result;
@@ -634,7 +711,7 @@ bool Shell::ExecuteString(Isolate* isolate, Local<String> source,
       printf("\n");
     }
   }
-  return true;
+  return success;
 }
 
 namespace {
@@ -1332,11 +1409,11 @@ void Shell::Load(const v8::FunctionCallbackInfo<v8::Value>& args) {
       Throw(args.GetIsolate(), "Error loading file");
       return;
     }
-    if (!ExecuteString(
-            args.GetIsolate(), source,
-            String::NewFromUtf8(args.GetIsolate(), *file,
-                                NewStringType::kNormal).ToLocalChecked(),
-            false, true)) {
+    if (!ExecuteString(args.GetIsolate(), source,
+                       String::NewFromUtf8(args.GetIsolate(), *file,
+                                           NewStringType::kNormal)
+                           .ToLocalChecked(),
+                       false, !options.quiet_load)) {
       Throw(args.GetIsolate(), "Error executing file");
       return;
     }
@@ -2188,7 +2265,6 @@ void Shell::ReadBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
   data->handle.Reset(isolate, buffer);
   data->handle.SetWeak(data, ReadBufferWeakCallback,
                        v8::WeakCallbackType::kParameter);
-  data->handle.MarkIndependent();
   isolate->AdjustAmountOfExternalAllocatedMemory(length);
 
   args.GetReturnValue().Set(buffer);
@@ -2200,7 +2276,7 @@ Local<String> Shell::ReadFile(Isolate* isolate, const char* name) {
   char* chars = ReadChars(name, &size);
   if (chars == nullptr) return Local<String>();
   Local<String> result;
-  if (i::FLAG_use_external_strings && internal::String::IsAscii(chars, size)) {
+  if (i::FLAG_use_external_strings && i::String::IsAscii(chars, size)) {
     String::ExternalOneByteStringResource* resource =
         new ExternalOwningOneByteStringResource(
             std::unique_ptr<const char[]>(chars), size);
@@ -2436,14 +2512,8 @@ Local<String> SourceGroup::ReadFile(Isolate* isolate, const char* name) {
   return Shell::ReadFile(isolate, name);
 }
 
-
-base::Thread::Options SourceGroup::GetThreadOptions() {
-  // On some systems (OSX 10.6) the stack size default is 0.5Mb or less
-  // which is not enough to parse the big literal expressions used in tests.
-  // The stack size should be at least StackGuard::kLimitSize + some
-  // OS-specific padding for thread startup code.  2Mbytes seems to be enough.
-  return base::Thread::Options("IsolateThread", 2 * MB);
-}
+SourceGroup::IsolateThread::IsolateThread(SourceGroup* group)
+    : base::Thread(GetThreadOptions("IsolateThread")), group_(group) {}
 
 void SourceGroup::ExecuteInThread() {
   Isolate::CreateParams create_params;
@@ -2471,11 +2541,11 @@ void SourceGroup::ExecuteInThread() {
                                            Shell::options.enable_inspector);
           PerIsolateData::RealmScope realm_scope(PerIsolateData::Get(isolate));
           Execute(isolate);
+          Shell::CompleteMessageLoop(isolate);
         }
         DisposeModuleEmbedderData(context);
       }
       Shell::CollectGarbage(isolate);
-      Shell::CompleteMessageLoop(isolate);
     }
     done_semaphore_.Signal();
   }
@@ -2505,7 +2575,9 @@ void SourceGroup::JoinThread() {
 }
 
 ExternalizedContents::~ExternalizedContents() {
-  Shell::array_buffer_allocator->Free(data_, size_);
+  if (base_ != nullptr) {
+    Shell::array_buffer_allocator->Free(base_, length_, mode_);
+  }
 }
 
 void SerializationDataQueue::Enqueue(std::unique_ptr<SerializationData> data) {
@@ -2714,6 +2786,13 @@ bool Shell::SetOptions(int argc, char* argv[]) {
     } else if (strcmp(argv[i], "--stress-deopt") == 0) {
       options.stress_deopt = true;
       argv[i] = nullptr;
+    } else if (strcmp(argv[i], "--stress-background-compile") == 0) {
+      options.stress_background_compile = true;
+      argv[i] = nullptr;
+    } else if (strcmp(argv[i], "--nostress-background-compile") == 0 ||
+               strcmp(argv[i], "--no-stress-background-compile") == 0) {
+      options.stress_background_compile = false;
+      argv[i] = nullptr;
     } else if (strcmp(argv[i], "--mock-arraybuffer-allocator") == 0) {
       options.mock_arraybuffer_allocator = true;
       argv[i] = nullptr;
@@ -2770,11 +2849,23 @@ bool Shell::SetOptions(int argc, char* argv[]) {
                strncmp(argv[i], "--cache=", 8) == 0) {
       const char* value = argv[i] + 7;
       if (!*value || strncmp(value, "=code", 6) == 0) {
-        options.compile_options = v8::ScriptCompiler::kProduceCodeCache;
+        options.compile_options = v8::ScriptCompiler::kNoCompileOptions;
+        options.code_cache_options =
+            ShellOptions::CodeCacheOptions::kProduceCache;
       } else if (strncmp(value, "=parse", 7) == 0) {
         options.compile_options = v8::ScriptCompiler::kProduceParserCache;
       } else if (strncmp(value, "=none", 6) == 0) {
         options.compile_options = v8::ScriptCompiler::kNoCompileOptions;
+        options.code_cache_options =
+            ShellOptions::CodeCacheOptions::kNoProduceCache;
+      } else if (strncmp(value, "=after-execute", 15) == 0) {
+        options.compile_options = v8::ScriptCompiler::kNoCompileOptions;
+        options.code_cache_options =
+            ShellOptions::CodeCacheOptions::kProduceCacheAfterExecute;
+      } else if (strncmp(value, "=full-code-cache", 17) == 0) {
+        options.compile_options = v8::ScriptCompiler::kEagerCompile;
+        options.code_cache_options =
+            ShellOptions::CodeCacheOptions::kProduceCache;
       } else {
         printf("Unknown option to --cache.\n");
         return false;
@@ -2782,6 +2873,9 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       argv[i] = nullptr;
     } else if (strcmp(argv[i], "--enable-tracing") == 0) {
       options.trace_enabled = true;
+      argv[i] = nullptr;
+    } else if (strncmp(argv[i], "--trace-path=", 13) == 0) {
+      options.trace_path = argv[i] + 13;
       argv[i] = nullptr;
     } else if (strncmp(argv[i], "--trace-config=", 15) == 0) {
       options.trace_config = argv[i] + 15;
@@ -2802,6 +2896,9 @@ bool Shell::SetOptions(int argc, char* argv[]) {
 #endif  // V8_OS_POSIX
     } else if (strcmp(argv[i], "--enable-os-system") == 0) {
       options.enable_os_system = true;
+      argv[i] = nullptr;
+    } else if (strcmp(argv[i], "--quiet-load") == 0) {
+      options.quiet_load = true;
       argv[i] = nullptr;
     }
   }
@@ -2860,6 +2957,7 @@ int Shell::RunMain(Isolate* isolate, int argc, char* argv[], bool last_run) {
       InspectorClient inspector_client(context, options.enable_inspector);
       PerIsolateData::RealmScope realm_scope(PerIsolateData::Get(isolate));
       options.isolate_sources[0].Execute(isolate);
+      CompleteMessageLoop(isolate);
     }
     if (!use_existing_context) {
       DisposeModuleEmbedderData(context);
@@ -2867,7 +2965,6 @@ int Shell::RunMain(Isolate* isolate, int argc, char* argv[], bool last_run) {
     WriteLcovData(isolate, options.lcov_file);
   }
   CollectGarbage(isolate);
-  CompleteMessageLoop(isolate);
   for (int i = 1; i < options.num_isolates; ++i) {
     if (last_run) {
       options.isolate_sources[i].JoinThread();
@@ -2910,7 +3007,7 @@ void Shell::SetWaitUntilDone(Isolate* isolate, bool value) {
 }
 
 namespace {
-void ProcessMessages(Isolate* isolate,
+bool ProcessMessages(Isolate* isolate,
                      std::function<platform::MessageLoopBehavior()> behavior) {
   Platform* platform = GetDefaultPlatform();
   while (true) {
@@ -2932,9 +3029,10 @@ void ProcessMessages(Isolate* isolate,
     Context::Scope context_scope(context);
     if (callback->Call(context, Undefined(isolate), 0, nullptr).IsEmpty()) {
       Shell::ReportException(isolate, &try_catch);
-      return;
+      return false;
     }
   }
+  return true;
 }
 }  // anonymous namespace
 
@@ -2948,9 +3046,9 @@ void Shell::CompleteMessageLoop(Isolate* isolate) {
   });
 }
 
-void Shell::EmptyMessageQueues(Isolate* isolate) {
-  ProcessMessages(isolate,
-                  []() { return platform::MessageLoopBehavior::kDoNotWait; });
+bool Shell::EmptyMessageQueues(Isolate* isolate) {
+  return ProcessMessages(
+      isolate, []() { return platform::MessageLoopBehavior::kDoNotWait; });
 }
 
 class Serializer : public ValueSerializer::Delegate {
@@ -3206,25 +3304,27 @@ int Shell::Main(int argc, char* argv[]) {
           ? v8::platform::InProcessStackDumping::kDisabled
           : v8::platform::InProcessStackDumping::kEnabled;
 
-  platform::tracing::TracingController* tracing_controller = nullptr;
+  std::unique_ptr<platform::tracing::TracingController> tracing;
   if (options.trace_enabled && !i::FLAG_verify_predictable) {
-    trace_file.open("v8_trace.json");
-    tracing_controller = new platform::tracing::TracingController();
+    tracing = base::make_unique<platform::tracing::TracingController>();
+
+    trace_file.open(options.trace_path ? options.trace_path : "v8_trace.json");
     platform::tracing::TraceBuffer* trace_buffer =
         platform::tracing::TraceBuffer::CreateTraceBufferRingBuffer(
             platform::tracing::TraceBuffer::kRingBufferChunks,
             platform::tracing::TraceWriter::CreateJSONTraceWriter(trace_file));
-    tracing_controller->Initialize(trace_buffer);
+    tracing->Initialize(trace_buffer);
   }
 
-  g_platform = v8::platform::CreateDefaultPlatform(
+  platform::tracing::TracingController* tracing_controller = tracing.get();
+  g_platform = v8::platform::NewDefaultPlatform(
       0, v8::platform::IdleTaskSupport::kEnabled, in_process_stack_dumping,
-      tracing_controller);
+      std::move(tracing));
   if (i::FLAG_verify_predictable) {
-    g_platform = new PredictablePlatform(std::unique_ptr<Platform>(g_platform));
+    g_platform.reset(new PredictablePlatform(std::move(g_platform)));
   }
 
-  v8::V8::InitializePlatform(g_platform);
+  v8::V8::InitializePlatform(g_platform.get());
   v8::V8::Initialize();
   if (options.natives_blob || options.snapshot_blob) {
     v8::V8::InitializeExternalStartupData(options.natives_blob,
@@ -3258,7 +3358,7 @@ int Shell::Main(int argc, char* argv[]) {
     create_params.add_histogram_sample_callback = AddHistogramSample;
   }
 
-  if (i::trap_handler::UseTrapHandler()) {
+  if (i::trap_handler::IsTrapHandlerEnabled()) {
     if (!v8::V8::RegisterDefaultSignalHandler()) {
       fprintf(stderr, "Could not register signal handler");
       exit(1);
@@ -3315,6 +3415,42 @@ int Shell::Main(int argc, char* argv[]) {
         bool last_run = i == options.stress_runs - 1;
         result = RunMain(isolate, argc, argv, last_run);
       }
+    } else if (options.code_cache_options !=
+               ShellOptions::CodeCacheOptions::kNoProduceCache) {
+      printf("============ Run: Produce code cache ============\n");
+      // First run to produce the cache
+      result = RunMain(isolate, argc, argv, false);
+
+      // Change the options to consume cache
+      if (options.compile_options == v8::ScriptCompiler::kProduceParserCache) {
+        options.compile_options = v8::ScriptCompiler::kConsumeParserCache;
+      } else {
+        DCHECK(options.compile_options == v8::ScriptCompiler::kEagerCompile ||
+               options.compile_options ==
+                   v8::ScriptCompiler::kNoCompileOptions);
+        options.compile_options = v8::ScriptCompiler::kConsumeCodeCache;
+      }
+
+      printf("============ Run: Consume code cache ============\n");
+      // Second run to consume the cache in new isolate
+      Isolate::CreateParams create_params;
+      create_params.array_buffer_allocator = Shell::array_buffer_allocator;
+      i::FLAG_hash_seed ^= 1337;  // Use a different hash seed.
+      Isolate* isolate2 = Isolate::New(create_params);
+      i::FLAG_hash_seed ^= 1337;  // Restore old hash seed.
+      isolate2->SetHostImportModuleDynamicallyCallback(
+          Shell::HostImportModuleDynamically);
+      isolate2->SetHostInitializeImportMetaObjectCallback(
+          Shell::HostInitializeImportMetaObject);
+      {
+        D8Console console(isolate2);
+        debug::SetConsoleDelegate(isolate2, &console);
+        PerIsolateData data(isolate2);
+        Isolate::Scope isolate_scope(isolate2);
+
+        result = RunMain(isolate2, argc, argv, true);
+      }
+      isolate2->Dispose();
     } else {
       bool last_run = true;
       result = RunMain(isolate, argc, argv, last_run);
@@ -3332,6 +3468,7 @@ int Shell::Main(int argc, char* argv[]) {
     }
 
     // Shut down contexts and collect garbage.
+    cached_code_map_.clear();
     evaluation_context_.Reset();
     stringify_function_.Reset();
     CollectGarbage(isolate);
@@ -3339,8 +3476,10 @@ int Shell::Main(int argc, char* argv[]) {
   OnExit(isolate);
   V8::Dispose();
   V8::ShutdownPlatform();
-  delete g_platform;
 
+  // Delete the platform explicitly here to write the tracing output to the
+  // tracing file.
+  g_platform.reset();
   return result;
 }
 
@@ -3352,3 +3491,6 @@ int main(int argc, char* argv[]) {
   return v8::Shell::Main(argc, argv);
 }
 #endif
+
+#undef CHECK
+#undef DCHECK

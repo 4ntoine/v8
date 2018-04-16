@@ -27,8 +27,6 @@
 #include <sys/sysctl.h>  // NOLINT, for sysctl
 #endif
 
-#undef MAP_TYPE
-
 #if defined(ANDROID) && !defined(V8_ANDROID_LOG_STDOUT)
 #define LOG_TAG "v8"
 #include <android/log.h>  // NOLINT
@@ -61,6 +59,22 @@
 #include <sys/syscall.h>
 #endif
 
+#if V8_OS_FREEBSD || V8_OS_MACOSX || V8_OS_OPENBSD || V8_OS_SOLARIS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
+#if defined(V8_OS_SOLARIS)
+#if (defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE > 2) || defined(__EXTENSIONS__)
+extern "C" int madvise(caddr_t, size_t, int);
+#else
+extern int madvise(caddr_t, size_t, int);
+#endif
+#endif
+
+#ifndef MADV_FREE
+#define MADV_FREE MADV_DONTNEED
+#endif
+
 namespace v8 {
 namespace base {
 
@@ -73,8 +87,89 @@ bool g_hard_abort = false;
 
 const char* g_gc_fake_mmap = nullptr;
 
+static LazyInstance<RandomNumberGenerator>::type
+    platform_random_number_generator = LAZY_INSTANCE_INITIALIZER;
+static LazyMutex rng_mutex = LAZY_MUTEX_INITIALIZER;
+
+#if !V8_OS_FUCHSIA
+#if V8_OS_MACOSX
+// kMmapFd is used to pass vm_alloc flags to tag the region with the user
+// defined tag 255 This helps identify V8-allocated regions in memory analysis
+// tools like vmmap(1).
+const int kMmapFd = VM_MAKE_TAG(255);
+#else   // !V8_OS_MACOSX
+const int kMmapFd = -1;
+#endif  // !V8_OS_MACOSX
+
+const int kMmapFdOffset = 0;
+
+int GetProtectionFromMemoryPermission(OS::MemoryPermission access) {
+  switch (access) {
+    case OS::MemoryPermission::kNoAccess:
+      return PROT_NONE;
+    case OS::MemoryPermission::kReadWrite:
+      return PROT_READ | PROT_WRITE;
+    case OS::MemoryPermission::kReadWriteExecute:
+      return PROT_READ | PROT_WRITE | PROT_EXEC;
+    case OS::MemoryPermission::kReadExecute:
+      return PROT_READ | PROT_EXEC;
+  }
+  UNREACHABLE();
+}
+
+int GetFlagsForMemoryPermission(OS::MemoryPermission access) {
+  int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+  if (access == OS::MemoryPermission::kNoAccess) {
+#if !V8_OS_AIX && !V8_OS_FREEBSD && !V8_OS_QNX
+    flags |= MAP_NORESERVE;
+#endif  // !V8_OS_AIX && !V8_OS_FREEBSD && !V8_OS_QNX
+#if V8_OS_QNX
+    flags |= MAP_LAZY;
+#endif  // V8_OS_QNX
+  }
+  return flags;
+}
+
+void* Allocate(void* address, size_t size, OS::MemoryPermission access) {
+  int prot = GetProtectionFromMemoryPermission(access);
+  int flags = GetFlagsForMemoryPermission(access);
+  void* result = mmap(address, size, prot, flags, kMmapFd, kMmapFdOffset);
+  if (result == MAP_FAILED) return nullptr;
+  return result;
+}
+
+int ReclaimInaccessibleMemory(void* address, size_t size) {
+#if defined(OS_MACOSX)
+  // On OSX, MADV_FREE_REUSABLE has comparable behavior to MADV_FREE, but also
+  // marks the pages with the reusable bit, which allows both Activity Monitor
+  // and memory-infra to correctly track the pages.
+  int ret = madvise(address, size, MADV_FREE_REUSABLE);
+#elif defined(_AIX) || defined(V8_OS_SOLARIS)
+  int ret = madvise(reinterpret_cast<caddr_t>(address), size, MADV_FREE);
+#else
+  int ret = madvise(address, size, MADV_FREE);
+#endif
+  if (ret != 0 && errno == EINVAL) {
+    // MADV_FREE only works on Linux 4.5+ . If request failed, retry with older
+    // MADV_DONTNEED . Note that MADV_FREE being defined at compile time doesn't
+    // imply runtime support.
+#if defined(_AIX) || defined(V8_OS_SOLARIS)
+    ret = madvise(reinterpret_cast<caddr_t>(address), size, MADV_DONTNEED);
+#else
+    ret = madvise(address, size, MADV_DONTNEED);
+#endif
+  }
+  return ret;
+}
+
+#endif  // !V8_OS_FUCHSIA
+
 }  // namespace
 
+void OS::Initialize(bool hard_abort, const char* const gc_fake_mmap) {
+  g_hard_abort = hard_abort;
+  g_gc_fake_mmap = gc_fake_mmap;
+}
 
 int OS::ActivationFrameAlignment() {
 #if V8_TARGET_ARCH_ARM
@@ -95,116 +190,72 @@ int OS::ActivationFrameAlignment() {
 #endif
 }
 
+// static
+size_t OS::AllocatePageSize() {
+  return static_cast<size_t>(sysconf(_SC_PAGESIZE));
+}
 
-intptr_t OS::CommitPageSize() {
-  static intptr_t page_size = getpagesize();
+// static
+size_t OS::CommitPageSize() {
+  static size_t page_size = getpagesize();
   return page_size;
 }
 
-void* OS::Allocate(const size_t requested, size_t* allocated,
-                   bool is_executable, void* hint) {
-  return OS::Allocate(requested, allocated,
-                      is_executable ? OS::MemoryPermission::kReadWriteExecute
-                                    : OS::MemoryPermission::kReadWrite,
-                      hint);
-}
-
-void OS::Free(void* address, const size_t size) {
-  // TODO(1240712): munmap has a return value which is ignored here.
-  int result = munmap(address, size);
-  USE(result);
-  DCHECK_EQ(result, 0);
-}
-
-void OS::SetReadAndExecutable(void* address, const size_t size) {
-#if V8_OS_CYGWIN
-  DWORD old_protect;
-  CHECK_NOT_NULL(
-      VirtualProtect(address, size, PAGE_EXECUTE_READ, &old_protect));
-#else
-  CHECK_EQ(0, mprotect(address, size, PROT_READ | PROT_EXEC));
-#endif
-}
-
-
-// Create guard pages.
-#if !V8_OS_FUCHSIA
-void OS::Guard(void* address, const size_t size) {
-#if V8_OS_CYGWIN
-  DWORD oldprotect;
-  VirtualProtect(address, size, PAGE_NOACCESS, &oldprotect);
-#else
-  mprotect(address, size, PROT_NONE);
-#endif
-}
-#endif  // !V8_OS_FUCHSIA
-
-// Make a region of memory readable and writable.
-void OS::SetReadAndWritable(void* address, const size_t size, bool commit) {
-#if V8_OS_CYGWIN
-  DWORD oldprotect;
-  CHECK_NOT_NULL(VirtualProtect(address, size, PAGE_READWRITE, &oldprotect));
-#else
-  CHECK_EQ(0, mprotect(address, size, PROT_READ | PROT_WRITE));
-#endif
-}
-
-static LazyInstance<RandomNumberGenerator>::type
-    platform_random_number_generator = LAZY_INSTANCE_INITIALIZER;
-
-void OS::Initialize(int64_t random_seed, bool hard_abort,
-                    const char* const gc_fake_mmap) {
-  if (random_seed) {
-    platform_random_number_generator.Pointer()->SetSeed(random_seed);
+// static
+void OS::SetRandomMmapSeed(int64_t seed) {
+  if (seed) {
+    LockGuard<Mutex> guard(rng_mutex.Pointer());
+    platform_random_number_generator.Pointer()->SetSeed(seed);
   }
-  g_hard_abort = hard_abort;
-  g_gc_fake_mmap = gc_fake_mmap;
 }
 
-
-const char* OS::GetGCFakeMMapFile() {
-  return g_gc_fake_mmap;
-}
-
+// static
 void* OS::GetRandomMmapAddr() {
-#if defined(ADDRESS_SANITIZER) || defined(MEMORY_SANITIZER) || \
-    defined(THREAD_SANITIZER)
-  // Dynamic tools do not support custom mmap addresses.
-  return NULL;
-#endif
   uintptr_t raw_addr;
-  platform_random_number_generator.Pointer()->NextBytes(&raw_addr,
-                                                        sizeof(raw_addr));
+  {
+    LockGuard<Mutex> guard(rng_mutex.Pointer());
+    platform_random_number_generator.Pointer()->NextBytes(&raw_addr,
+                                                          sizeof(raw_addr));
+  }
+#if defined(V8_USE_ADDRESS_SANITIZER) || defined(MEMORY_SANITIZER) || \
+    defined(THREAD_SANITIZER) || defined(LEAK_SANITIZER)
+  // If random hint addresses interfere with address ranges hard coded in
+  // sanitizers, bad things happen. This address range is copied from TSAN
+  // source but works with all tools.
+  // See crbug.com/539863.
+  raw_addr &= 0x007fffff0000ULL;
+  raw_addr += 0x7e8000000000ULL;
+#else
 #if V8_TARGET_ARCH_X64
   // Currently available CPUs have 48 bits of virtual addressing.  Truncate
   // the hint address to 46 bits to give the kernel a fighting chance of
   // fulfilling our placement request.
-  raw_addr &= V8_UINT64_C(0x3ffffffff000);
+  raw_addr &= uint64_t{0x3FFFFFFFF000};
 #elif V8_TARGET_ARCH_PPC64
 #if V8_OS_AIX
   // AIX: 64 bits of virtual addressing, but we limit address range to:
   //   a) minimize Segment Lookaside Buffer (SLB) misses and
-  raw_addr &= V8_UINT64_C(0x3ffff000);
+  raw_addr &= uint64_t{0x3FFFF000};
   // Use extra address space to isolate the mmap regions.
-  raw_addr += V8_UINT64_C(0x400000000000);
+  raw_addr += uint64_t{0x400000000000};
 #elif V8_TARGET_BIG_ENDIAN
   // Big-endian Linux: 44 bits of virtual addressing.
-  raw_addr &= V8_UINT64_C(0x03fffffff000);
+  raw_addr &= uint64_t{0x03FFFFFFF000};
 #else
   // Little-endian Linux: 48 bits of virtual addressing.
-  raw_addr &= V8_UINT64_C(0x3ffffffff000);
+  raw_addr &= uint64_t{0x3FFFFFFFF000};
 #endif
 #elif V8_TARGET_ARCH_S390X
   // Linux on Z uses bits 22-32 for Region Indexing, which translates to 42 bits
   // of virtual addressing.  Truncate to 40 bits to allow kernel chance to
   // fulfill request.
-  raw_addr &= V8_UINT64_C(0xfffffff000);
+  raw_addr &= uint64_t{0xFFFFFFF000};
 #elif V8_TARGET_ARCH_S390
   // 31 bits of virtual addressing.  Truncate to 29 bits to allow kernel chance
   // to fulfill request.
-  raw_addr &= 0x1ffff000;
+  raw_addr &= 0x1FFFF000;
 #else
-  raw_addr &= 0x3ffff000;
+  raw_addr &= 0x3FFFF000;
 
 #ifdef __sun
   // For our Solaris/illumos mmap hint, we pick a random address in the bottom
@@ -228,11 +279,86 @@ void* OS::GetRandomMmapAddr() {
   raw_addr += 0x20000000;
 #endif
 #endif
+#endif
   return reinterpret_cast<void*>(raw_addr);
 }
 
-size_t OS::AllocateAlignment() {
-  return static_cast<size_t>(sysconf(_SC_PAGESIZE));
+// TODO(bbudge) Move Cygwin and Fuschia stuff into platform-specific files.
+#if !V8_OS_CYGWIN && !V8_OS_FUCHSIA
+// static
+void* OS::Allocate(void* address, size_t size, size_t alignment,
+                   MemoryPermission access) {
+  size_t page_size = AllocatePageSize();
+  DCHECK_EQ(0, size % page_size);
+  DCHECK_EQ(0, alignment % page_size);
+  address = AlignedAddress(address, alignment);
+  // Add the maximum misalignment so we are guaranteed an aligned base address.
+  size_t request_size = size + (alignment - page_size);
+  request_size = RoundUp(request_size, OS::AllocatePageSize());
+  void* result = base::Allocate(address, request_size, access);
+  if (result == nullptr) return nullptr;
+
+  // Unmap memory allocated before the aligned base address.
+  uint8_t* base = static_cast<uint8_t*>(result);
+  uint8_t* aligned_base = RoundUp(base, alignment);
+  if (aligned_base != base) {
+    DCHECK_LT(base, aligned_base);
+    size_t prefix_size = static_cast<size_t>(aligned_base - base);
+    CHECK(Free(base, prefix_size));
+    request_size -= prefix_size;
+  }
+  // Unmap memory allocated after the potentially unaligned end.
+  if (size != request_size) {
+    DCHECK_LT(size, request_size);
+    size_t suffix_size = request_size - size;
+    CHECK(Free(aligned_base + size, suffix_size));
+    request_size -= suffix_size;
+  }
+
+  DCHECK_EQ(size, request_size);
+  return static_cast<void*>(aligned_base);
+}
+
+// static
+bool OS::Free(void* address, const size_t size) {
+  DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % AllocatePageSize());
+  DCHECK_EQ(0, size % AllocatePageSize());
+  return munmap(address, size) == 0;
+}
+
+// static
+bool OS::Release(void* address, size_t size) {
+  DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % CommitPageSize());
+  DCHECK_EQ(0, size % CommitPageSize());
+  return munmap(address, size) == 0;
+}
+
+// static
+bool OS::SetPermissions(void* address, size_t size, MemoryPermission access) {
+  DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % CommitPageSize());
+  DCHECK_EQ(0, size % CommitPageSize());
+
+  int prot = GetProtectionFromMemoryPermission(access);
+  int ret = mprotect(address, size, prot);
+  if (ret == 0 && access == OS::MemoryPermission::kNoAccess) {
+    ret = ReclaimInaccessibleMemory(address, size);
+  }
+  return ret == 0;
+}
+
+// static
+bool OS::HasLazyCommits() {
+#if V8_OS_AIX || V8_OS_LINUX || V8_OS_MACOSX
+  return true;
+#else
+  // TODO(bbudge) Return true for all POSIX platforms.
+  return false;
+#endif
+}
+#endif  // !V8_OS_CYGWIN && !V8_OS_FUCHSIA
+
+const char* OS::GetGCFakeMMapFile() {
+  return g_gc_fake_mmap;
 }
 
 
@@ -328,7 +454,7 @@ OS::MemoryMappedFile* OS::MemoryMappedFile::create(const char* name,
 
 
 PosixMemoryMappedFile::~PosixMemoryMappedFile() {
-  if (memory_) OS::Free(memory_, size_);
+  if (memory_) CHECK(OS::Free(memory_, size_));
   fclose(file_);
 }
 
@@ -747,17 +873,9 @@ void Thread::SetThreadLocal(LocalStorageKey key, void* value) {
   USE(result);
 }
 
-int GetProtectionFromMemoryPermission(OS::MemoryPermission access) {
-  switch (access) {
-    case OS::MemoryPermission::kNoAccess:
-      return PROT_NONE;
-    case OS::MemoryPermission::kReadWrite:
-      return PROT_READ | PROT_WRITE;
-    case OS::MemoryPermission::kReadWriteExecute:
-      return PROT_READ | PROT_WRITE | PROT_EXEC;
-  }
-  UNREACHABLE();
-}
+#undef LOG_TAG
+#undef MAP_ANONYMOUS
+#undef MADV_FREE
 
 }  // namespace base
 }  // namespace v8

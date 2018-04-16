@@ -40,7 +40,7 @@ TEST(WasmRelocationIa32ContextReference) {
   __ nop();
   __ ret(0);
 
-  compiler::CSignature0<int32_t> csig;
+  compiler::CSignatureOf<int32_t> csig;
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
   Handle<Code> code =
@@ -64,6 +64,8 @@ TEST(WasmRelocationIa32ContextReference) {
   // Relocating references by offset
   int mode_mask = (1 << RelocInfo::WASM_CONTEXT_REFERENCE);
   for (RelocIterator it(*code, mode_mask); !it.done(); it.next()) {
+    // TODO(6792): No longer needed once WebAssembly code is off heap.
+    CodeSpaceMemoryModificationScope modification_scope(isolate->heap());
     DCHECK(RelocInfo::IsWasmContextReference(it.rinfo()->rmode()));
     it.rinfo()->set_wasm_context_reference(
         isolate, it.rinfo()->wasm_context_reference() + offset,

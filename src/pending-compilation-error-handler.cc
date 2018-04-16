@@ -14,8 +14,8 @@
 namespace v8 {
 namespace internal {
 
-Handle<String> PendingCompilationErrorHandler::ArgumentString(
-    Isolate* isolate) {
+Handle<String> PendingCompilationErrorHandler::MessageDetails::ArgumentString(
+    Isolate* isolate) const {
   if (arg_ != nullptr) return arg_->string();
   if (char_arg_ != nullptr) {
     return isolate->factory()
@@ -25,26 +25,84 @@ Handle<String> PendingCompilationErrorHandler::ArgumentString(
   return isolate->factory()->undefined_string();
 }
 
-Handle<String> PendingCompilationErrorHandler::FormatMessage(Isolate* isolate) {
-  return MessageTemplate::FormatMessage(isolate, message_,
-                                        ArgumentString(isolate));
+MessageLocation PendingCompilationErrorHandler::MessageDetails::GetLocation(
+    Handle<Script> script) const {
+  return MessageLocation(script, start_position_, end_position_);
+}
+
+void PendingCompilationErrorHandler::ReportMessageAt(
+    int start_position, int end_position, MessageTemplate::Template message,
+    const char* arg, ParseErrorType error_type) {
+  if (has_pending_error_) return;
+  has_pending_error_ = true;
+
+  error_details_ =
+      MessageDetails(start_position, end_position, message, nullptr, arg);
+  error_type_ = error_type;
+}
+
+void PendingCompilationErrorHandler::ReportMessageAt(
+    int start_position, int end_position, MessageTemplate::Template message,
+    const AstRawString* arg, ParseErrorType error_type) {
+  if (has_pending_error_) return;
+  has_pending_error_ = true;
+
+  error_details_ =
+      MessageDetails(start_position, end_position, message, arg, nullptr);
+  error_type_ = error_type;
+}
+
+void PendingCompilationErrorHandler::ReportWarningAt(
+    int start_position, int end_position, MessageTemplate::Template message,
+    const char* arg) {
+  warning_messages_.emplace_front(
+      MessageDetails(start_position, end_position, message, nullptr, arg));
+}
+
+void PendingCompilationErrorHandler::ReportWarnings(Isolate* isolate,
+                                                    Handle<Script> script) {
+  DCHECK(!has_pending_error());
+
+  for (const MessageDetails& warning : warning_messages_) {
+    MessageLocation location = warning.GetLocation(script);
+    Handle<String> argument = warning.ArgumentString(isolate);
+    Handle<JSMessageObject> message =
+        MessageHandler::MakeMessageObject(isolate, warning.message(), &location,
+                                          argument, Handle<FixedArray>::null());
+    message->set_error_level(v8::Isolate::kMessageWarning);
+    MessageHandler::ReportMessage(isolate, &location, message);
+  }
+}
+
+void PendingCompilationErrorHandler::ReportErrors(
+    Isolate* isolate, Handle<Script> script,
+    AstValueFactory* ast_value_factory) {
+  if (stack_overflow()) {
+    isolate->StackOverflow();
+  } else {
+    DCHECK(has_pending_error());
+    // Internalize ast values for throwing the pending error.
+    ast_value_factory->Internalize(isolate);
+    ThrowPendingError(isolate, script);
+  }
 }
 
 void PendingCompilationErrorHandler::ThrowPendingError(Isolate* isolate,
                                                        Handle<Script> script) {
   if (!has_pending_error_) return;
-  MessageLocation location(script, start_position_, end_position_);
-  Factory* factory = isolate->factory();
-  Handle<String> argument = ArgumentString(isolate);
+
+  MessageLocation location = error_details_.GetLocation(script);
+  Handle<String> argument = error_details_.ArgumentString(isolate);
   isolate->debug()->OnCompileError(script);
 
+  Factory* factory = isolate->factory();
   Handle<Object> error;
   switch (error_type_) {
     case kReferenceError:
-      error = factory->NewReferenceError(message_, argument);
+      error = factory->NewReferenceError(error_details_.message(), argument);
       break;
     case kSyntaxError:
-      error = factory->NewSyntaxError(message_, argument);
+      error = factory->NewSyntaxError(error_details_.message(), argument);
       break;
     default:
       UNREACHABLE();
@@ -76,5 +134,12 @@ void PendingCompilationErrorHandler::ThrowPendingError(Isolate* isolate,
 
   isolate->Throw(*error, &location);
 }
+
+Handle<String> PendingCompilationErrorHandler::FormatErrorMessageForTest(
+    Isolate* isolate) const {
+  return MessageTemplate::FormatMessage(isolate, error_details_.message(),
+                                        error_details_.ArgumentString(isolate));
+}
+
 }  // namespace internal
 }  // namespace v8

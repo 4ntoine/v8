@@ -476,6 +476,13 @@ v8::CpuProfile* ProfilerHelper::Run(v8::Local<v8::Function> function,
   return profile;
 }
 
+static unsigned TotalHitCount(const v8::CpuProfileNode* node) {
+  unsigned hit_count = node->GetHitCount();
+  for (int i = 0, count = node->GetChildrenCount(); i < count; ++i)
+    hit_count += TotalHitCount(node->GetChild(i));
+  return hit_count;
+}
+
 static const v8::CpuProfileNode* FindChild(v8::Local<v8::Context> context,
                                            const v8::CpuProfileNode* node,
                                            const char* name) {
@@ -490,16 +497,22 @@ static const v8::CpuProfileNode* FindChild(v8::Local<v8::Context> context,
   return nullptr;
 }
 
+static const v8::CpuProfileNode* FindChild(const v8::CpuProfileNode* node,
+                                           const char* name) {
+  for (int i = 0, count = node->GetChildrenCount(); i < count; ++i) {
+    const v8::CpuProfileNode* child = node->GetChild(i);
+    if (strcmp(child->GetFunctionNameStr(), name) == 0) {
+      return child;
+    }
+  }
+  return nullptr;
+}
 
 static const v8::CpuProfileNode* GetChild(v8::Local<v8::Context> context,
                                           const v8::CpuProfileNode* node,
                                           const char* name) {
   const v8::CpuProfileNode* result = FindChild(context, node, name);
-  if (!result) {
-    char buffer[100];
-    i::SNPrintF(i::ArrayVector(buffer), "Failed to GetChild: %s", name);
-    FATAL(buffer);
-  }
+  if (!result) FATAL("Failed to GetChild: %s", name);
   return result;
 }
 
@@ -1473,7 +1486,7 @@ static const char* js_force_collect_sample_source =
     "}";
 
 static void CallCollectSample(const v8::FunctionCallbackInfo<v8::Value>& info) {
-  i::ProfilerExtension::profiler()->CollectSample();
+  v8::CpuProfiler::CollectSample(info.GetIsolate());
 }
 
 TEST(CollectSampleAPI) {
@@ -1728,6 +1741,85 @@ TEST(FunctionDetails) {
                        script_a->GetUnboundScript()->GetId(), 5, 14);
 }
 
+TEST(FunctionDetailsInlining) {
+  if (!CcTest::i_isolate()->use_optimizer() || i::FLAG_always_opt) return;
+  i::FLAG_allow_natives_syntax = true;
+  v8::HandleScope scope(CcTest::isolate());
+  v8::Local<v8::Context> env = CcTest::NewContext(PROFILER_EXTENSION);
+  v8::Context::Scope context_scope(env);
+  ProfilerHelper helper(env);
+
+  // alpha is in a_script, beta in b_script. beta is
+  // inlined in alpha, but it should be attributed to b_script.
+
+  v8::Local<v8::Script> script_b = CompileWithOrigin(
+      "function beta(k) {\n"
+      "  let sum = 2;\n"
+      "  for(let i = 0; i < k; i ++) {\n"
+      "    sum += i;\n"
+      "    sum = sum + 'a';\n"
+      "  }\n"
+      "  return sum;\n"
+      "}\n"
+      "\n",
+      "script_b");
+
+  v8::Local<v8::Script> script_a = CompileWithOrigin(
+      "function alpha(p) {\n"
+      "  let res = beta(p);\n"
+      "  res = res + res;\n"
+      "  return res;\n"
+      "}\n"
+      "let p = 2;\n"
+      "\n"
+      "\n"
+      "// Warm up before profiling or the inlining doesn't happen.\n"
+      "p = alpha(p);\n"
+      "p = alpha(p);\n"
+      "%OptimizeFunctionOnNextCall(alpha);\n"
+      "p = alpha(p);\n"
+      "\n"
+      "\n"
+      "startProfiling();\n"
+      "for(let i = 0; i < 10000; i++) {\n"
+      "  p = alpha(p);\n"
+      "}\n"
+      "stopProfiling();\n"
+      "\n"
+      "\n",
+      "script_a");
+
+  script_b->Run(env).ToLocalChecked();
+  script_a->Run(env).ToLocalChecked();
+
+  const v8::CpuProfile* profile = i::ProfilerExtension::last_profile;
+  const v8::CpuProfileNode* current = profile->GetTopDownRoot();
+  reinterpret_cast<ProfileNode*>(const_cast<v8::CpuProfileNode*>(current))
+      ->Print(0);
+  //   The tree should look like this:
+  //  0  (root) 0 #1
+  //  5    (program) 0 #6
+  //  2     14 #2 script_a:1
+  //    ;;; deopted at script_id: 14 position: 299 with reason 'Insufficient
+  //    type feedback for call'.
+  //  1      alpha 14 #4 script_a:1
+  //  9        beta 13 #5 script_b:0
+  //  0      startProfiling 0 #3
+
+  const v8::CpuProfileNode* root = profile->GetTopDownRoot();
+  const v8::CpuProfileNode* script = GetChild(env, root, "");
+  CheckFunctionDetails(env->GetIsolate(), script, "", "script_a",
+                       script_a->GetUnboundScript()->GetId(), 1, 1);
+  const v8::CpuProfileNode* alpha = FindChild(env, script, "alpha");
+  // Return early if profiling didn't sample alpha.
+  if (!alpha) return;
+  CheckFunctionDetails(env->GetIsolate(), alpha, "alpha", "script_a",
+                       script_a->GetUnboundScript()->GetId(), 1, 15);
+  const v8::CpuProfileNode* beta = FindChild(env, alpha, "beta");
+  if (!beta) return;
+  CheckFunctionDetails(env->GetIsolate(), beta, "beta", "script_b",
+                       script_b->GetUnboundScript()->GetId(), 0, 0);
+}
 
 TEST(DontStopOnFinishedProfileDelete) {
   v8::HandleScope scope(CcTest::isolate());
@@ -1862,7 +1954,7 @@ TEST(CollectDeoptEvents) {
         GetBranchDeoptReason(env, iprofile, branch, arraysize(branch));
     if (deopt_reason != reason(i::DeoptimizeReason::kNotAHeapNumber) &&
         deopt_reason != reason(i::DeoptimizeReason::kNotASmi)) {
-      FATAL(deopt_reason);
+      FATAL("%s", deopt_reason);
     }
   }
   {
@@ -1872,7 +1964,7 @@ TEST(CollectDeoptEvents) {
     if (deopt_reason != reason(i::DeoptimizeReason::kNaN) &&
         deopt_reason != reason(i::DeoptimizeReason::kLostPrecisionOrNaN) &&
         deopt_reason != reason(i::DeoptimizeReason::kNotASmi)) {
-      FATAL(deopt_reason);
+      FATAL("%s", deopt_reason);
     }
   }
   {
@@ -2131,17 +2223,19 @@ class CpuProfileEventChecker : public v8::platform::tracing::TraceWriter {
 
 TEST(TracingCpuProfiler) {
   v8::Platform* old_platform = i::V8::GetCurrentPlatform();
-  v8::Platform* default_platform = v8::platform::CreateDefaultPlatform();
-  i::V8::SetPlatformForTesting(default_platform);
+  std::unique_ptr<v8::Platform> default_platform =
+      v8::platform::NewDefaultPlatform();
+  i::V8::SetPlatformForTesting(default_platform.get());
 
-  v8::platform::tracing::TracingController tracing_controller;
-  static_cast<v8::platform::DefaultPlatform*>(default_platform)
-      ->SetTracingController(&tracing_controller);
+  auto tracing = base::make_unique<v8::platform::tracing::TracingController>();
+  v8::platform::tracing::TracingController* tracing_controller = tracing.get();
+  static_cast<v8::platform::DefaultPlatform*>(default_platform.get())
+      ->SetTracingController(std::move(tracing));
 
   CpuProfileEventChecker* event_checker = new CpuProfileEventChecker();
   TraceBuffer* ring_buffer =
       TraceBuffer::CreateTraceBufferRingBuffer(1, event_checker);
-  tracing_controller.Initialize(ring_buffer);
+  tracing_controller->Initialize(ring_buffer);
   TraceConfig* trace_config = new TraceConfig();
   trace_config->AddIncludedCategory(
       TRACE_DISABLED_BY_DEFAULT("v8.cpu_profiler"));
@@ -2149,10 +2243,10 @@ TEST(TracingCpuProfiler) {
   LocalContext env;
   v8::HandleScope scope(env->GetIsolate());
   {
-    tracing_controller.StartTracing(trace_config);
+    tracing_controller->StartTracing(trace_config);
     auto profiler = v8::TracingCpuProfiler::Create(env->GetIsolate());
     CompileRun("function foo() { } foo();");
-    tracing_controller.StopTracing();
+    tracing_controller->StopTracing();
     CompileRun("function bar() { } bar();");
   }
 
@@ -2225,6 +2319,119 @@ TEST(Issue763073) {
   v8::CpuProfile* p = cpu_profiler->StopProfiling(profile_name);
   p->Delete();
   cpu_profiler->Dispose();
+}
+
+static const char* js_collect_sample_api_source =
+    "%NeverOptimizeFunction(start);\n"
+    "function start() {\n"
+    "  CallStaticCollectSample();\n"
+    "}";
+
+static void CallStaticCollectSample(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::CpuProfiler::CollectSample(info.GetIsolate());
+}
+
+TEST(StaticCollectSampleAPI) {
+  i::FLAG_allow_natives_syntax = true;
+  LocalContext env;
+  v8::HandleScope scope(env->GetIsolate());
+
+  v8::Local<v8::FunctionTemplate> func_template =
+      v8::FunctionTemplate::New(env->GetIsolate(), CallStaticCollectSample);
+  v8::Local<v8::Function> func =
+      func_template->GetFunction(env.local()).ToLocalChecked();
+  func->SetName(v8_str("CallStaticCollectSample"));
+  env->Global()
+      ->Set(env.local(), v8_str("CallStaticCollectSample"), func)
+      .FromJust();
+
+  CompileRun(js_collect_sample_api_source);
+  v8::Local<v8::Function> function = GetFunction(env.local(), "start");
+
+  ProfilerHelper helper(env.local());
+  v8::CpuProfile* profile = helper.Run(function, nullptr, 0, 100);
+
+  const v8::CpuProfileNode* root = profile->GetTopDownRoot();
+  const v8::CpuProfileNode* start_node = GetChild(env.local(), root, "start");
+  GetChild(env.local(), start_node, "CallStaticCollectSample");
+
+  profile->Delete();
+}
+
+TEST(CodeEntriesMemoryLeak) {
+  v8::HandleScope scope(CcTest::isolate());
+  v8::Local<v8::Context> env = CcTest::NewContext(PROFILER_EXTENSION);
+  v8::Context::Scope context_scope(env);
+
+  std::string source = "function start() {}\n";
+  for (int i = 0; i < 1000; ++i) {
+    source += "function foo" + std::to_string(i) + "() { return " +
+              std::to_string(i) +
+              "; }\n"
+              "foo" +
+              std::to_string(i) + "();\n";
+  }
+  CompileRun(source.c_str());
+  v8::Local<v8::Function> function = GetFunction(env, "start");
+
+  ProfilerHelper helper(env);
+
+  for (int j = 0; j < 100; ++j) {
+    v8::CpuProfile* profile = helper.Run(function, nullptr, 0);
+    profile->Delete();
+  }
+  ProfilerListener* profiler_listener =
+      CcTest::i_isolate()->logger()->profiler_listener();
+
+  CHECK_GE(10000ul, profiler_listener->entries_count_for_test());
+}
+
+TEST(NativeFrameStackTrace) {
+  // A test for issue https://crbug.com/768540
+  // When a sample lands in a native function which has not EXIT frame
+  // stack frame iterator used to bail out and produce an empty stack trace.
+  // The source code below makes v8 call the
+  // v8::internal::StringTable::LookupStringIfExists_NoAllocate native function
+  // without producing an EXIT frame.
+  v8::HandleScope scope(CcTest::isolate());
+  v8::Local<v8::Context> env = CcTest::NewContext(PROFILER_EXTENSION);
+  v8::Context::Scope context_scope(env);
+
+  const char* source = R"(
+      function jsFunction() {
+        var s = {};
+        for (var i = 0; i < 1e4; ++i) {
+          for (var j = 0; j < 100; j++) {
+            s['item' + j] = 'alph';
+          }
+        }
+      })";
+
+  CompileRun(source);
+  v8::Local<v8::Function> function = GetFunction(env, "jsFunction");
+
+  ProfilerHelper helper(env);
+
+  v8::CpuProfile* profile = helper.Run(function, nullptr, 0, 100, 0, true);
+
+  // Count the fraction of samples landing in 'jsFunction' (valid stack)
+  // vs '(program)' (no stack captured).
+  const v8::CpuProfileNode* root = profile->GetTopDownRoot();
+  const v8::CpuProfileNode* js_function = FindChild(root, "jsFunction");
+  const v8::CpuProfileNode* program = FindChild(root, "(program)");
+  if (program) {
+    unsigned js_function_samples = TotalHitCount(js_function);
+    unsigned program_samples = TotalHitCount(program);
+    double valid_samples_ratio =
+        1. * js_function_samples / (js_function_samples + program_samples);
+    i::PrintF("Ratio: %f\n", valid_samples_ratio);
+    // TODO(alph): Investigate other causes of dropped frames. The ratio
+    // should be close to 99%.
+    CHECK_GE(valid_samples_ratio, 0.3);
+  }
+
+  profile->Delete();
 }
 
 }  // namespace test_cpu_profiler

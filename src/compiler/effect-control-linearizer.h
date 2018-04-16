@@ -30,8 +30,11 @@ class SourcePositionTable;
 
 class V8_EXPORT_PRIVATE EffectControlLinearizer {
  public:
+  enum MaskArrayIndexEnable { kDoNotMaskArrayIndex, kMaskArrayIndex };
+
   EffectControlLinearizer(JSGraph* graph, Schedule* schedule, Zone* temp_zone,
-                          SourcePositionTable* source_positions);
+                          SourcePositionTable* source_positions,
+                          MaskArrayIndexEnable mask_array_index);
 
   void Run();
 
@@ -53,6 +56,7 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   Node* LowerChangeTaggedToUint32(Node* node);
   Node* LowerChangeTaggedToTaggedSigned(Node* node);
   Node* LowerCheckBounds(Node* node, Node* frame_state);
+  Node* LowerMaskIndexWithBound(Node* node);
   Node* LowerCheckInternalizedString(Node* node, Node* frame_state);
   void LowerCheckMaps(Node* node, Node* frame_state);
   Node* LowerCompareMaps(Node* node);
@@ -79,12 +83,16 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   Node* LowerCheckedTaggedToTaggedSigned(Node* node, Node* frame_state);
   Node* LowerCheckedTaggedToTaggedPointer(Node* node, Node* frame_state);
   Node* LowerChangeTaggedToFloat64(Node* node);
+  void TruncateTaggedPointerToBit(Node* node, GraphAssemblerLabel<1>* done);
   Node* LowerTruncateTaggedToBit(Node* node);
   Node* LowerTruncateTaggedPointerToBit(Node* node);
   Node* LowerTruncateTaggedToFloat64(Node* node);
   Node* LowerTruncateTaggedToWord32(Node* node);
   Node* LowerCheckedTruncateTaggedToWord32(Node* node, Node* frame_state);
+  Node* LowerAllocate(Node* node);
+  Node* LowerNumberToString(Node* node);
   Node* LowerObjectIsArrayBufferView(Node* node);
+  Node* LowerObjectIsBigInt(Node* node);
   Node* LowerObjectIsCallable(Node* node);
   Node* LowerObjectIsConstructor(Node* node);
   Node* LowerObjectIsDetectableCallable(Node* node);
@@ -97,21 +105,28 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   Node* LowerObjectIsString(Node* node);
   Node* LowerObjectIsSymbol(Node* node);
   Node* LowerObjectIsUndetectable(Node* node);
+  Node* LowerNumberIsFloat64Hole(Node* node);
   Node* LowerArgumentsFrame(Node* node);
   Node* LowerArgumentsLength(Node* node);
   Node* LowerNewDoubleElements(Node* node);
   Node* LowerNewSmiOrObjectElements(Node* node);
   Node* LowerNewArgumentsElements(Node* node);
+  Node* LowerNewConsString(Node* node);
   Node* LowerArrayBufferWasNeutered(Node* node);
+  Node* LowerSameValue(Node* node);
+  Node* LowerDeadValue(Node* node);
   Node* LowerStringToNumber(Node* node);
   Node* LowerStringCharAt(Node* node);
   Node* LowerStringCharCodeAt(Node* node);
   Node* LowerSeqStringCharCodeAt(Node* node);
+  Node* LowerStringCodePointAt(Node* node);
+  Node* LowerSeqStringCodePointAt(Node* node, UnicodeEncoding encoding);
   Node* LowerStringToLowerCaseIntl(Node* node);
   Node* LowerStringToUpperCaseIntl(Node* node);
   Node* LowerStringFromCharCode(Node* node);
   Node* LowerStringFromCodePoint(Node* node);
   Node* LowerStringIndexOf(Node* node);
+  Node* LowerStringLength(Node* node);
   Node* LowerStringEqual(Node* node);
   Node* LowerStringLessThan(Node* node);
   Node* LowerStringLessThanOrEqual(Node* node);
@@ -139,6 +154,7 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   void LowerTransitionAndStoreNumberElement(Node* node);
   void LowerTransitionAndStoreNonNumberElement(Node* node);
   void LowerRuntimeAbort(Node* node);
+  Node* LowerConvertReceiver(Node* node);
 
   // Lowering of optional operators.
   Maybe<Node*> LowerFloat64RoundUp(Node* node);
@@ -147,9 +163,11 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   Maybe<Node*> LowerFloat64RoundTruncate(Node* node);
 
   Node* AllocateHeapNumberWithValue(Node* node);
-  Node* BuildCheckedFloat64ToInt32(CheckForMinusZeroMode mode, Node* value,
+  Node* BuildCheckedFloat64ToInt32(CheckForMinusZeroMode mode,
+                                   const VectorSlotPair& feedback, Node* value,
                                    Node* frame_state);
   Node* BuildCheckedHeapNumberOrOddballToFloat64(CheckTaggedInputMode mode,
+                                                 const VectorSlotPair& feedback,
                                                  Node* value,
                                                  Node* frame_state);
   Node* BuildFloat64RoundDown(Node* value);
@@ -164,6 +182,7 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   Node* ChangeSmiToIntPtr(Node* value);
   Node* ChangeSmiToInt32(Node* value);
   Node* ObjectIsSmi(Node* value);
+  Node* LoadFromString(Node* receiver, Node* position, Node* is_one_byte);
 
   Node* SmiMaxValueConstant();
   Node* SmiShiftBitsConstant();
@@ -185,6 +204,7 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {
   JSGraph* js_graph_;
   Schedule* schedule_;
   Zone* temp_zone_;
+  MaskArrayIndexEnable mask_array_index_;
   RegionObservability region_observability_ = RegionObservability::kObservable;
   SourcePositionTable* source_positions_;
   GraphAssembler graph_assembler_;

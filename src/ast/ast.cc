@@ -5,6 +5,7 @@
 #include "src/ast/ast.h"
 
 #include <cmath>  // For isfinite.
+#include <vector>
 
 #include "src/ast/compile-time-value.h"
 #include "src/ast/prettyprinter.h"
@@ -14,7 +15,7 @@
 #include "src/builtins/builtins.h"
 #include "src/code-stubs.h"
 #include "src/contexts.h"
-#include "src/conversions.h"
+#include "src/conversions-inl.h"
 #include "src/double.h"
 #include "src/elements.h"
 #include "src/objects-inl.h"
@@ -90,15 +91,15 @@ MaterializedLiteral* AstNode::AsMaterializedLiteral() {
 #undef RETURN_NODE
 
 bool Expression::IsSmiLiteral() const {
-  return IsLiteral() && AsLiteral()->raw_value()->IsSmi();
+  return IsLiteral() && AsLiteral()->type() == Literal::kSmi;
 }
 
 bool Expression::IsNumberLiteral() const {
-  return IsLiteral() && AsLiteral()->raw_value()->IsNumber();
+  return IsLiteral() && AsLiteral()->IsNumber();
 }
 
 bool Expression::IsStringLiteral() const {
-  return IsLiteral() && AsLiteral()->raw_value()->IsString();
+  return IsLiteral() && AsLiteral()->type() == Literal::kString;
 }
 
 bool Expression::IsPropertyName() const {
@@ -106,12 +107,15 @@ bool Expression::IsPropertyName() const {
 }
 
 bool Expression::IsNullLiteral() const {
-  if (!IsLiteral()) return false;
-  return AsLiteral()->raw_value()->IsNull();
+  return IsLiteral() && AsLiteral()->type() == Literal::kNull;
+}
+
+bool Expression::IsTheHoleLiteral() const {
+  return IsLiteral() && AsLiteral()->type() == Literal::kTheHole;
 }
 
 bool Expression::IsUndefinedLiteral() const {
-  if (IsLiteral() && AsLiteral()->raw_value()->IsUndefined()) return true;
+  if (IsLiteral() && AsLiteral()->type() == Literal::kUndefined) return true;
 
   const VariableProxy* var_proxy = AsVariableProxy();
   if (var_proxy == nullptr) return false;
@@ -245,6 +249,34 @@ bool FunctionLiteral::NeedsHomeObject(Expression* expr) {
   return expr->AsFunctionLiteral()->scope()->NeedsHomeObject();
 }
 
+std::unique_ptr<char[]> FunctionLiteral::GetDebugName() const {
+  const AstConsString* cons_string;
+  if (raw_name_ != nullptr && !raw_name_->IsEmpty()) {
+    cons_string = raw_name_;
+  } else if (raw_inferred_name_ != nullptr && !raw_inferred_name_->IsEmpty()) {
+    cons_string = raw_inferred_name_;
+  } else if (!inferred_name_.is_null()) {
+    AllowHandleDereference allow_deref;
+    return inferred_name_->ToCString();
+  } else {
+    return std::unique_ptr<char[]>(new char{'\0'});
+  }
+
+  // TODO(rmcilroy): Deal with two-character strings.
+  std::vector<char> result_vec;
+  std::forward_list<const AstRawString*> strings = cons_string->ToRawStrings();
+  for (const AstRawString* string : strings) {
+    if (!string->is_one_byte()) break;
+    for (int i = 0; i < string->length(); i++) {
+      result_vec.push_back(string->raw_data()[i]);
+    }
+  }
+  std::unique_ptr<char[]> result(new char[result_vec.size() + 1]);
+  memcpy(result.get(), result_vec.data(), result_vec.size());
+  result[result_vec.size()] = '\0';
+  return result;
+}
+
 ObjectLiteralProperty::ObjectLiteralProperty(Expression* key, Expression* value,
                                              Kind kind, bool is_computed_name)
     : LiteralProperty(key, value, is_computed_name),
@@ -255,9 +287,8 @@ ObjectLiteralProperty::ObjectLiteralProperty(AstValueFactory* ast_value_factory,
                                              Expression* key, Expression* value,
                                              bool is_computed_name)
     : LiteralProperty(key, value, is_computed_name), emit_store_(true) {
-  if (!is_computed_name &&
-      key->AsLiteral()->raw_value()->EqualsString(
-          ast_value_factory->proto_string())) {
+  if (!is_computed_name && key->AsLiteral()->IsString() &&
+      key->AsLiteral()->AsRawString() == ast_value_factory->proto_string()) {
     kind_ = PROTOTYPE;
   } else if (value_->AsMaterializedLiteral() != nullptr) {
     kind_ = MATERIALIZED_LITERAL;
@@ -279,7 +310,8 @@ ClassLiteralProperty::ClassLiteralProperty(Expression* key, Expression* value,
                                            bool is_computed_name)
     : LiteralProperty(key, value, is_computed_name),
       kind_(kind),
-      is_static_(is_static) {}
+      is_static_(is_static),
+      computed_name_var_(nullptr) {}
 
 bool ObjectLiteral::Property::IsCompileTimeValue() const {
   return kind_ == CONSTANT ||
@@ -373,7 +405,7 @@ int ObjectLiteral::InitDepthAndFlags() {
       needs_initial_allocation_site |= literal->NeedsInitialAllocationSite();
     }
 
-    const AstValue* key = property->key()->AsLiteral()->raw_value();
+    Literal* key = property->key()->AsLiteral();
     Expression* value = property->value();
 
     bool is_compile_time_value = CompileTimeValue::IsCompileTimeValue(value);
@@ -384,12 +416,11 @@ int ObjectLiteral::InitDepthAndFlags() {
     // much larger than the number of elements, creating an object
     // literal with fast elements will be a waste of space.
     uint32_t element_index = 0;
-    if (key->IsString() && key->AsString()->AsArrayIndex(&element_index)) {
+    if (key->AsArrayIndex(&element_index)) {
       max_element_index = Max(element_index, max_element_index);
       elements++;
-    } else if (key->ToUint32(&element_index) && element_index != kMaxUInt32) {
-      max_element_index = Max(element_index, max_element_index);
-      elements++;
+    } else {
+      DCHECK(key->IsPropertyName());
     }
 
     nof_properties++;
@@ -419,11 +450,9 @@ void ObjectLiteral::BuildConstantProperties(Isolate* isolate) {
       continue;
     }
 
-    Handle<Object> key = property->key()->AsLiteral()->value();
+    Literal* key = property->key()->AsLiteral();
 
-    uint32_t element_index = 0;
-    if (key->ToArrayIndex(&element_index) ||
-        (key->IsString() && String::cast(*key)->AsArrayIndex(&element_index))) {
+    if (!key->IsPropertyName()) {
       index_keys++;
     }
   }
@@ -452,15 +481,14 @@ void ObjectLiteral::BuildConstantProperties(Isolate* isolate) {
     // Add CONSTANT and COMPUTED properties to boilerplate. Use undefined
     // value for COMPUTED properties, the real value is filled in at
     // runtime. The enumeration order is maintained.
-    Handle<Object> key = property->key()->AsLiteral()->value();
-    Handle<Object> value = GetBoilerplateValue(property->value(), isolate);
-
+    Literal* key_literal = property->key()->AsLiteral();
     uint32_t element_index = 0;
-    if (key->IsString() && String::cast(*key)->AsArrayIndex(&element_index)) {
-      key = isolate->factory()->NewNumberFromUint(element_index);
-    } else if (key->IsNumber() && !key->ToArrayIndex(&element_index)) {
-      key = isolate->factory()->NumberToString(key);
-    }
+    Handle<Object> key =
+        key_literal->AsArrayIndex(&element_index)
+            ? isolate->factory()->NewNumberFromUint(element_index)
+            : Handle<Object>::cast(key_literal->AsRawPropertyName()->string());
+
+    Handle<Object> value = GetBoilerplateValue(property->value(), isolate);
 
     // Add name, value pair to the fixed array.
     constant_properties->set(position++, *key);
@@ -486,18 +514,17 @@ bool ArrayLiteral::is_empty() const {
 }
 
 int ArrayLiteral::InitDepthAndFlags() {
-  DCHECK_LT(first_spread_index_, 0);
   if (is_initialized()) return depth();
 
-  int constants_length = values()->length();
+  int constants_length =
+      first_spread_index_ >= 0 ? first_spread_index_ : values()->length();
 
   // Fill in the literals.
-  bool is_simple = true;
+  bool is_simple = first_spread_index_ < 0;
   int depth_acc = 1;
   int array_index = 0;
   for (; array_index < constants_length; array_index++) {
     Expression* element = values()->at(array_index);
-    DCHECK(!element->IsSpread());
     MaterializedLiteral* literal = element->AsMaterializedLiteral();
     if (literal != nullptr) {
       int subliteral_depth = literal->InitDepthAndFlags() + 1;
@@ -518,11 +545,10 @@ int ArrayLiteral::InitDepthAndFlags() {
 }
 
 void ArrayLiteral::BuildConstantElements(Isolate* isolate) {
-  DCHECK_LT(first_spread_index_, 0);
-
   if (!constant_elements_.is_null()) return;
 
-  int constants_length = values()->length();
+  int constants_length =
+      first_spread_index_ >= 0 ? first_spread_index_ : values()->length();
   ElementsKind kind = FIRST_FAST_ELEMENTS_KIND;
   Handle<FixedArray> fixed_array =
       isolate->factory()->NewFixedArrayWithHoles(constants_length);
@@ -586,11 +612,6 @@ bool ArrayLiteral::IsFastCloningSupported() const {
              ConstructorBuiltins::kMaximumClonedShallowArrayElements;
 }
 
-void ArrayLiteral::RewindSpreads() {
-  values_->Rewind(first_spread_index_);
-  first_spread_index_ = -1;
-}
-
 bool MaterializedLiteral::IsSimple() const {
   if (IsArrayLiteral()) return AsArrayLiteral()->is_simple();
   if (IsObjectLiteral()) return AsObjectLiteral()->is_simple();
@@ -601,7 +622,7 @@ bool MaterializedLiteral::IsSimple() const {
 Handle<Object> MaterializedLiteral::GetBoilerplateValue(Expression* expression,
                                                         Isolate* isolate) {
   if (expression->IsLiteral()) {
-    return expression->AsLiteral()->value();
+    return expression->AsLiteral()->BuildValue(isolate);
   }
   if (CompileTimeValue::IsCompileTimeValue(expression)) {
     return CompileTimeValue::GetValue(isolate, expression);
@@ -643,18 +664,23 @@ Handle<TemplateObjectDescription> GetTemplateObject::GetOrBuildDescription(
       isolate->factory()->NewFixedArray(this->raw_strings()->length(), TENURED);
   bool raw_and_cooked_match = true;
   for (int i = 0; i < raw_strings->length(); ++i) {
-    if (*this->raw_strings()->at(i)->value() !=
-        *this->cooked_strings()->at(i)->value()) {
+    if (this->cooked_strings()->at(i) == nullptr ||
+        *this->raw_strings()->at(i)->string() !=
+            *this->cooked_strings()->at(i)->string()) {
       raw_and_cooked_match = false;
     }
-    raw_strings->set(i, *this->raw_strings()->at(i)->value());
+    raw_strings->set(i, *this->raw_strings()->at(i)->string());
   }
   Handle<FixedArray> cooked_strings = raw_strings;
   if (!raw_and_cooked_match) {
     cooked_strings = isolate->factory()->NewFixedArray(
         this->cooked_strings()->length(), TENURED);
     for (int i = 0; i < cooked_strings->length(); ++i) {
-      cooked_strings->set(i, *this->cooked_strings()->at(i)->value());
+      if (this->cooked_strings()->at(i) != nullptr) {
+        cooked_strings->set(i, *this->cooked_strings()->at(i)->string());
+      } else {
+        cooked_strings->set(i, isolate->heap()->undefined_value());
+      }
     }
   }
   return isolate->factory()->NewTemplateObjectDescription(
@@ -779,25 +805,121 @@ Call::CallType Call::GetCallType() const {
     }
   }
 
+  if (expression()->IsResolvedProperty()) {
+    return RESOLVED_PROPERTY_CALL;
+  }
+
   return OTHER_CALL;
 }
 
 CaseClause::CaseClause(Expression* label, ZoneList<Statement*>* statements)
     : label_(label), statements_(statements) {}
 
+bool Literal::IsPropertyName() const {
+  if (type() != kString) return false;
+  uint32_t index;
+  return !string_->AsArrayIndex(&index);
+}
+
+bool Literal::ToUint32(uint32_t* value) const {
+  switch (type()) {
+    case kString:
+      return string_->AsArrayIndex(value);
+    case kSmi:
+      if (smi_ < 0) return false;
+      *value = static_cast<uint32_t>(smi_);
+      return true;
+    case kHeapNumber:
+      return DoubleToUint32IfEqualToSelf(AsNumber(), value);
+    default:
+      return false;
+  }
+}
+
+bool Literal::AsArrayIndex(uint32_t* value) const {
+  return ToUint32(value) && *value != kMaxUInt32;
+}
+
+Handle<Object> Literal::BuildValue(Isolate* isolate) const {
+  switch (type()) {
+    case kSmi:
+      return handle(Smi::FromInt(smi_), isolate);
+    case kHeapNumber:
+      return isolate->factory()->NewNumber(number_, TENURED);
+    case kString:
+      return string_->string();
+    case kSymbol:
+      return isolate->factory()->home_object_symbol();
+    case kBoolean:
+      return isolate->factory()->ToBoolean(boolean_);
+    case kNull:
+      return isolate->factory()->null_value();
+    case kUndefined:
+      return isolate->factory()->undefined_value();
+    case kTheHole:
+      return isolate->factory()->the_hole_value();
+    case kBigInt:
+      // This should never fail: the parser will never create a BigInt
+      // literal that cannot be allocated.
+      return BigIntLiteral(isolate, bigint_.c_str()).ToHandleChecked();
+  }
+  UNREACHABLE();
+}
+
+bool Literal::ToBooleanIsTrue() const {
+  switch (type()) {
+    case kSmi:
+      return smi_ != 0;
+    case kHeapNumber:
+      return DoubleToBoolean(number_);
+    case kString:
+      return !string_->IsEmpty();
+    case kNull:
+    case kUndefined:
+      return false;
+    case kBoolean:
+      return boolean_;
+    case kBigInt: {
+      const char* bigint_str = bigint_.c_str();
+      size_t length = strlen(bigint_str);
+      DCHECK_GT(length, 0);
+      if (length == 1 && bigint_str[0] == '0') return false;
+      // Skip over any radix prefix; BigInts with length > 1 only
+      // begin with zero if they include a radix.
+      for (size_t i = (bigint_str[0] == '0') ? 2 : 0; i < length; ++i) {
+        if (bigint_str[i] != '0') return true;
+      }
+      return false;
+    }
+    case kSymbol:
+      return true;
+    case kTheHole:
+      UNREACHABLE();
+  }
+  UNREACHABLE();
+}
+
 uint32_t Literal::Hash() {
-  return raw_value()->IsString()
-             ? raw_value()->AsString()->Hash()
-             : ComputeLongHash(double_to_uint64(raw_value()->AsNumber()));
+  return IsString() ? AsRawString()->Hash()
+                    : ComputeLongHash(double_to_uint64(AsNumber()));
 }
 
 
 // static
-bool Literal::Match(void* literal1, void* literal2) {
-  const AstValue* x = static_cast<Literal*>(literal1)->raw_value();
-  const AstValue* y = static_cast<Literal*>(literal2)->raw_value();
-  return (x->IsString() && y->IsString() && x->AsString() == y->AsString()) ||
+bool Literal::Match(void* a, void* b) {
+  Literal* x = static_cast<Literal*>(a);
+  Literal* y = static_cast<Literal*>(b);
+  return (x->IsString() && y->IsString() &&
+          x->AsRawString() == y->AsRawString()) ||
          (x->IsNumber() && y->IsNumber() && x->AsNumber() == y->AsNumber());
+}
+
+Literal* AstNodeFactory::NewNumberLiteral(double number, int pos) {
+  int int_value;
+  if (DoubleToSmiInteger(number, &int_value)) {
+    return NewSmiLiteral(int_value, pos);
+  }
+  return new (zone_) Literal(number, pos);
 }
 
 const char* CallRuntime::debug_name() {

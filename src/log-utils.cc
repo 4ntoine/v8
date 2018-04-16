@@ -42,10 +42,10 @@ Log::Log(Logger* logger, const char* file_name)
   if (FLAG_log_all) {
     FLAG_log_api = true;
     FLAG_log_code = true;
-    FLAG_log_gc = true;
     FLAG_log_suspect = true;
     FLAG_log_handles = true;
     FLAG_log_internal_timer_events = true;
+    FLAG_log_function_events = true;
   }
 
   // --prof implies --log-code.
@@ -105,17 +105,6 @@ void Log::MessageBuilder::AppendVA(const char* format, va_list args) {
   AppendStringPart(log_->format_buffer_, length);
 }
 
-void Log::MessageBuilder::Append(String* string) {
-  DisallowHeapAllocation no_gc;  // Ensure string stay valid.
-  std::unique_ptr<char[]> characters =
-      string->ToCString(DISALLOW_NULLS, ROBUST_STRING_TRAVERSAL);
-  AppendString(characters.get());
-}
-
-void Log::MessageBuilder::AppendAddress(Address addr) {
-  Append("0x%" V8PRIxPTR, reinterpret_cast<intptr_t>(addr));
-}
-
 void Log::MessageBuilder::AppendSymbolName(Symbol* symbol) {
   DCHECK(symbol);
   OFStream& os = log_->os_;
@@ -150,6 +139,7 @@ void Log::MessageBuilder::AppendString(String* str) {
 }
 
 void Log::MessageBuilder::AppendString(const char* string) {
+  if (string == nullptr) return;
   for (const char* p = string; *p != '\0'; p++) {
     this->AppendCharacter(*p);
   }
@@ -161,7 +151,7 @@ void Log::MessageBuilder::AppendStringPart(String* str, int len) {
   // TODO(cbruni): unify escaping.
   for (int i = 0; i < len; i++) {
     uc32 c = str->Get(i);
-    if (c <= 0xff) {
+    if (c <= 0xFF) {
       AppendCharacter(static_cast<char>(c));
     } else {
       // Escape any non-ascii range characters.
@@ -170,8 +160,8 @@ void Log::MessageBuilder::AppendStringPart(String* str, int len) {
   }
 }
 
-void Log::MessageBuilder::AppendStringPart(const char* str, int len) {
-  for (int i = 0; i < len; i++) {
+void Log::MessageBuilder::AppendStringPart(const char* str, size_t len) {
+  for (size_t i = 0; i < len; i++) {
     DCHECK_NE(str[i], '\0');
     this->AppendCharacter(str[i]);
   }
@@ -179,17 +169,19 @@ void Log::MessageBuilder::AppendStringPart(const char* str, int len) {
 
 void Log::MessageBuilder::AppendCharacter(char c) {
   OFStream& os = log_->os_;
-  // A log entry (separate by commas) cannot contain commas or line-brakes.
+  // A log entry (separate by commas) cannot contain commas or line-breaks.
   if (c >= 32 && c <= 126) {
     if (c == ',') {
-      // Escape commas directly.
-      os << "\x2c";
+      // Escape commas (log field separator) directly.
+      os << "\\x2C";
     } else {
       // Directly append any printable ascii character.
       os << c;
     }
+  } else if (c == '\n') {
+    os << "\\n";
   } else {
-    // Escape any non-printable haracters.
+    // Escape any non-printable characters.
     Append("\\x%02x", c);
   }
 }
@@ -200,6 +192,15 @@ template <>
 Log::MessageBuilder& Log::MessageBuilder::operator<<<const char*>(
     const char* string) {
   this->AppendString(string);
+  return *this;
+}
+
+template <>
+Log::MessageBuilder& Log::MessageBuilder::operator<<<void*>(void* pointer) {
+  OFStream& os = log_->os_;
+  // Manually format the pointer since on Windows we do not consistently
+  // get a "0x" prefix.
+  os << "0x" << std::hex << reinterpret_cast<intptr_t>(pointer) << std::dec;
   return *this;
 }
 

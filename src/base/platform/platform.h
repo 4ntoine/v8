@@ -36,6 +36,7 @@
 #endif
 
 namespace v8 {
+
 namespace base {
 
 // ----------------------------------------------------------------------------
@@ -93,9 +94,8 @@ inline intptr_t InternalGetExistingThreadLocal(intptr_t index) {
 
 #endif  // V8_NO_FAST_TLS
 
-
+class PageAllocator;
 class TimezoneCache;
-
 
 // ----------------------------------------------------------------------------
 // OS
@@ -107,11 +107,9 @@ class TimezoneCache;
 class V8_BASE_EXPORT OS {
  public:
   // Initialize the OS class.
-  // - random_seed: Used for the GetRandomMmapAddress() if non-zero.
   // - hard_abort: If true, OS::Abort() will crash instead of aborting.
   // - gc_fake_mmap: Name of the file for fake gc mmap used in ll_prof.
-  static void Initialize(int64_t random_seed, bool hard_abort,
-                         const char* const gc_fake_mmap);
+  static void Initialize(bool hard_abort, const char* const gc_fake_mmap);
 
   // Returns the accumulated user time for thread. This routine
   // can be used for profiling. The implementation should
@@ -157,58 +155,15 @@ class V8_BASE_EXPORT OS {
   static PRINTF_FORMAT(1, 2) void PrintError(const char* format, ...);
   static PRINTF_FORMAT(1, 0) void VPrintError(const char* format, va_list args);
 
-  // Memory access permissions. Only the modes currently used by V8 are listed
-  // here even though most systems support additional modes.
-  enum class MemoryPermission { kNoAccess, kReadWrite, kReadWriteExecute };
-
-  // Allocate/Free memory used by JS heap. Permissions are set according to the
-  // is_* flags. Returns the address of allocated memory, or nullptr if failed.
-  static void* Allocate(const size_t requested, size_t* allocated,
-                        MemoryPermission access, void* hint = nullptr);
-  // Allocate/Free memory used by JS heap. Pages are readable/writable, but
-  // they are not guaranteed to be executable unless 'executable' is true.
-  // Returns the address of allocated memory, or nullptr if failed.
-  static void* Allocate(const size_t requested, size_t* allocated,
-                        bool is_executable, void* hint = nullptr);
-  static void Free(void* address, const size_t size);
-
-  // Allocates a region of memory that is inaccessible. On Windows this reserves
-  // but does not commit the memory. On POSIX systems it allocates memory as
-  // PROT_NONE, which also prevents it from being committed.
-  static void* AllocateGuarded(const size_t requested);
-
-  // This is the granularity at which the SetReadAndExecutable(...) call can
-  // set page permissions.
-  static intptr_t CommitPageSize();
-
-  // Mark a region of memory executable and readable but not writable.
-  static void SetReadAndExecutable(void* address, const size_t size);
-
-  // Assign memory as a guard page so that access will cause an exception.
-  static void Guard(void* address, const size_t size);
-
-  // Make a region of memory non-executable but readable and writable.
-  static void SetReadAndWritable(void* address, const size_t size, bool commit);
-
-  // Generate a random address to be used for hinting mmap().
-  static void* GetRandomMmapAddr();
-
-  // Get the Alignment guaranteed by Allocate().
-  static size_t AllocateAlignment();
-
-  static void* ReserveRegion(size_t size, void* hint);
-
-  static void* ReserveAlignedRegion(size_t size, size_t alignment, void* hint,
-                                    size_t* allocated);
-
-  static bool CommitRegion(void* address, size_t size, bool is_executable);
-
-  static bool UncommitRegion(void* address, size_t size);
-
-  static bool ReleaseRegion(void* address, size_t size);
-
-  // Release part of a reserved address range.
-  static bool ReleasePartialRegion(void* address, size_t size);
+  // Memory permissions. These should be kept in sync with the ones in
+  // v8::PageAllocator.
+  enum class MemoryPermission {
+    kNoAccess,
+    kReadWrite,
+    // TODO(hpayer): Remove this flag. Memory should never be rwx.
+    kReadWriteExecute,
+    kReadExecute
+  };
 
   static bool HasLazyCommits();
 
@@ -291,6 +246,30 @@ class V8_BASE_EXPORT OS {
   static int GetCurrentThreadId();
 
  private:
+  // These classes use the private memory management API below.
+  friend class MemoryMappedFile;
+  friend class PosixMemoryMappedFile;
+  friend class v8::base::PageAllocator;
+
+  static size_t AllocatePageSize();
+
+  static size_t CommitPageSize();
+
+  static void SetRandomMmapSeed(int64_t seed);
+
+  static void* GetRandomMmapAddr();
+
+  V8_WARN_UNUSED_RESULT static void* Allocate(void* address, size_t size,
+                                              size_t alignment,
+                                              MemoryPermission access);
+
+  V8_WARN_UNUSED_RESULT static bool Free(void* address, const size_t size);
+
+  V8_WARN_UNUSED_RESULT static bool Release(void* address, size_t size);
+
+  V8_WARN_UNUSED_RESULT static bool SetPermissions(void* address, size_t size,
+                                                   MemoryPermission access);
+
   static const int msPerSecond = 1000;
 
 #if V8_OS_POSIX

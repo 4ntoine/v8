@@ -151,6 +151,7 @@ namespace internal {
                                                                    \
   /* Identifiers (not keywords or future reserved words). */       \
   T(IDENTIFIER, nullptr, 0)                                        \
+  T(PRIVATE_NAME, nullptr, 0)                                      \
                                                                    \
   /* Future reserved words (ECMA-262, section 7.6.1.2). */         \
   T(FUTURE_STRICT_RESERVED_WORD, nullptr, 0)                       \
@@ -247,10 +248,6 @@ class Token {
 
   static bool IsBinaryOp(Value op) { return COMMA <= op && op <= EXP; }
 
-  static bool IsTruncatingBinaryOp(Value op) {
-    return BIT_OR <= op && op <= SHR;
-  }
-
   static bool IsCompareOp(Value op) {
     return EQ <= op && op <= IN;
   }
@@ -261,62 +258,6 @@ class Token {
 
   static bool IsEqualityOp(Value op) {
     return op == EQ || op == EQ_STRICT;
-  }
-
-  static bool IsInequalityOp(Value op) {
-    return op == NE || op == NE_STRICT;
-  }
-
-  static bool IsArithmeticCompareOp(Value op) {
-    return IsOrderedRelationalCompareOp(op) ||
-        IsEqualityOp(op) || IsInequalityOp(op);
-  }
-
-  static Value NegateCompareOp(Value op) {
-    DCHECK(IsArithmeticCompareOp(op));
-    switch (op) {
-      case EQ: return NE;
-      case NE: return EQ;
-      case EQ_STRICT: return NE_STRICT;
-      case NE_STRICT: return EQ_STRICT;
-      case LT: return GTE;
-      case GT: return LTE;
-      case LTE: return GT;
-      case GTE: return LT;
-      default:
-        UNREACHABLE();
-    }
-  }
-
-  static Value ReverseCompareOp(Value op) {
-    DCHECK(IsArithmeticCompareOp(op));
-    switch (op) {
-      case EQ: return EQ;
-      case NE: return NE;
-      case EQ_STRICT: return EQ_STRICT;
-      case NE_STRICT: return NE_STRICT;
-      case LT: return GT;
-      case GT: return LT;
-      case LTE: return GTE;
-      case GTE: return LTE;
-      default:
-        UNREACHABLE();
-    }
-  }
-
-  static bool EvalComparison(Value op, double op1, double op2) {
-    DCHECK(IsArithmeticCompareOp(op));
-    switch (op) {
-      case Token::EQ:
-      case Token::EQ_STRICT: return (op1 == op2);
-      case Token::NE: return (op1 != op2);
-      case Token::LT: return (op1 < op2);
-      case Token::GT: return (op1 > op2);
-      case Token::LTE: return (op1 <= op2);
-      case Token::GTE: return (op1 >= op2);
-      default:
-        UNREACHABLE();
-    }
   }
 
   static Value BinaryOpForAssignment(Value op) {
@@ -344,6 +285,8 @@ class Token {
         return Token::DIV;
       case Token::ASSIGN_MOD:
         return Token::MOD;
+      case Token::ASSIGN_EXP:
+        return Token::EXP;
       default:
         UNREACHABLE();
     }

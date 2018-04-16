@@ -8,20 +8,39 @@
 #include "src/counters.h"
 #include "src/objects-inl.h"
 #include "src/objects/bigint.h"
-#include "src/parsing/token.h"
 
 namespace v8 {
 namespace internal {
 
-RUNTIME_FUNCTION(Runtime_BigIntEqual) {
+RUNTIME_FUNCTION(Runtime_BigIntCompareToBigInt) {
+  SealHandleScope shs(isolate);
+  DCHECK_EQ(3, args.length());
+  CONVERT_ARG_HANDLE_CHECKED(Smi, mode, 0);
+  CONVERT_ARG_HANDLE_CHECKED(BigInt, lhs, 1);
+  CONVERT_ARG_HANDLE_CHECKED(BigInt, rhs, 2);
+  bool result = ComparisonResultToBool(static_cast<Operation>(mode->value()),
+                                       BigInt::CompareToBigInt(lhs, rhs));
+  return *isolate->factory()->ToBoolean(result);
+}
+
+RUNTIME_FUNCTION(Runtime_BigIntCompareToNumber) {
+  SealHandleScope shs(isolate);
+  DCHECK_EQ(3, args.length());
+  CONVERT_ARG_HANDLE_CHECKED(Smi, mode, 0);
+  CONVERT_ARG_HANDLE_CHECKED(BigInt, lhs, 1);
+  CONVERT_ARG_HANDLE_CHECKED(Object, rhs, 2);
+  bool result = ComparisonResultToBool(static_cast<Operation>(mode->value()),
+                                       BigInt::CompareToNumber(lhs, rhs));
+  return *isolate->factory()->ToBoolean(result);
+}
+
+RUNTIME_FUNCTION(Runtime_BigIntEqualToBigInt) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(2, args.length());
-  CONVERT_ARG_HANDLE_CHECKED(Object, lhs, 0);
-  CONVERT_ARG_HANDLE_CHECKED(Object, rhs, 1);
-  bool result = lhs->IsBigInt() && rhs->IsBigInt() &&
-                BigInt::EqualToBigInt(BigInt::cast(*lhs), BigInt::cast(*rhs));
+  CONVERT_ARG_HANDLE_CHECKED(BigInt, lhs, 0);
+  CONVERT_ARG_HANDLE_CHECKED(BigInt, rhs, 1);
+  bool result = BigInt::EqualToBigInt(*lhs, *rhs);
   return *isolate->factory()->ToBoolean(result);
-  // TODO(neis): Remove IsBigInt checks?
 }
 
 RUNTIME_FUNCTION(Runtime_BigIntEqualToNumber) {
@@ -49,12 +68,20 @@ RUNTIME_FUNCTION(Runtime_BigIntToBoolean) {
   return *isolate->factory()->ToBoolean(bigint->ToBoolean());
 }
 
+RUNTIME_FUNCTION(Runtime_BigIntToNumber) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(1, args.length());
+  CONVERT_ARG_HANDLE_CHECKED(BigInt, x, 0);
+  return *BigInt::ToNumber(x);
+}
+
 RUNTIME_FUNCTION(Runtime_BigIntBinaryOp) {
   HandleScope scope(isolate);
   DCHECK_EQ(3, args.length());
   CONVERT_ARG_HANDLE_CHECKED(Object, left_obj, 0);
   CONVERT_ARG_HANDLE_CHECKED(Object, right_obj, 1);
   CONVERT_SMI_ARG_CHECKED(opcode, 2);
+  Operation op = static_cast<Operation>(opcode);
 
   if (!left_obj->IsBigInt() || !right_obj->IsBigInt()) {
     THROW_NEW_ERROR_RETURN_FAILURE(
@@ -63,38 +90,41 @@ RUNTIME_FUNCTION(Runtime_BigIntBinaryOp) {
   Handle<BigInt> left(Handle<BigInt>::cast(left_obj));
   Handle<BigInt> right(Handle<BigInt>::cast(right_obj));
   MaybeHandle<BigInt> result;
-  switch (opcode) {
-    case Token::ADD:
+  switch (op) {
+    case Operation::kAdd:
       result = BigInt::Add(left, right);
       break;
-    case Token::SUB:
+    case Operation::kSubtract:
       result = BigInt::Subtract(left, right);
       break;
-    case Token::MUL:
+    case Operation::kMultiply:
       result = BigInt::Multiply(left, right);
       break;
-    case Token::DIV:
+    case Operation::kDivide:
       result = BigInt::Divide(left, right);
       break;
-    case Token::MOD:
+    case Operation::kModulus:
       result = BigInt::Remainder(left, right);
       break;
-    case Token::BIT_AND:
+    case Operation::kExponentiate:
+      result = BigInt::Exponentiate(left, right);
+      break;
+    case Operation::kBitwiseAnd:
       result = BigInt::BitwiseAnd(left, right);
       break;
-    case Token::BIT_OR:
+    case Operation::kBitwiseOr:
       result = BigInt::BitwiseOr(left, right);
       break;
-    case Token::BIT_XOR:
+    case Operation::kBitwiseXor:
       result = BigInt::BitwiseXor(left, right);
       break;
-    case Token::SHL:
+    case Operation::kShiftLeft:
       result = BigInt::LeftShift(left, right);
       break;
-    case Token::SAR:
+    case Operation::kShiftRight:
       result = BigInt::SignedRightShift(left, right);
       break;
-    case Token::SHR:
+    case Operation::kShiftRightLogical:
       result = BigInt::UnsignedRightShift(left, right);
       break;
     default:
@@ -108,19 +138,20 @@ RUNTIME_FUNCTION(Runtime_BigIntUnaryOp) {
   DCHECK_EQ(2, args.length());
   CONVERT_ARG_HANDLE_CHECKED(BigInt, x, 0);
   CONVERT_SMI_ARG_CHECKED(opcode, 1);
+  Operation op = static_cast<Operation>(opcode);
 
   MaybeHandle<BigInt> result;
-  switch (opcode) {
-    case Token::BIT_NOT:
+  switch (op) {
+    case Operation::kBitwiseNot:
       result = BigInt::BitwiseNot(x);
       break;
-    case Token::SUB:
+    case Operation::kNegate:
       result = BigInt::UnaryMinus(x);
       break;
-    case Token::INC:
+    case Operation::kIncrement:
       result = BigInt::Increment(x);
       break;
-    case Token::DEC:
+    case Operation::kDecrement:
       result = BigInt::Decrement(x);
       break;
     default:

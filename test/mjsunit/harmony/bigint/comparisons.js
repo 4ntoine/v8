@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --allow-natives-syntax --harmony-bigint --no-opt
+// Flags: --allow-natives-syntax --harmony-bigint
 
 'use strict'
 
@@ -94,6 +94,8 @@ const six = BigInt(6);
   assertTrue(%Equal("", zero));
   assertTrue(%Equal(one, "1"));
   assertTrue(%Equal("1", one));
+  assertFalse(%Equal(one, "a"));
+  assertFalse(%Equal("a", one));
 
   assertTrue(%Equal(one, {valueOf() { return true }}));
   assertTrue(%Equal({valueOf() { return true }}, one));
@@ -146,6 +148,10 @@ const six = BigInt(6);
   assertTrue(one == "1");
   assertTrue("1" == one);
   assertFalse(" \t\r\n" == one);
+  assertFalse(one == "a");
+  assertFalse("a" == one);
+
+  assertTrue(zero == "00000000000000" + "0");
 
   assertTrue(one == {valueOf() { return true }});
   assertTrue({valueOf() { return true }} == one);
@@ -154,6 +160,18 @@ const six = BigInt(6);
 
   assertFalse(Symbol() == zero);
   assertFalse(zero == Symbol());
+
+  assertTrue(one == "0b1");
+  assertTrue(" 0b1" == one);
+  assertTrue(one == "0o1");
+  assertTrue("0o1 " == one);
+  assertTrue(one == "\n0x1");
+  assertTrue("0x1" == one);
+
+  assertFalse(one == "1j");
+  assertFalse(one == "0b1ju");
+  assertFalse(one == "0o1jun");
+  assertFalse(one == "0x1junk");
 }{
   assertFalse(%NotEqual(zero, zero));
   assertFalse(%NotEqual(zero, another_zero));
@@ -196,6 +214,8 @@ const six = BigInt(6);
   assertFalse(%NotEqual("", zero));
   assertFalse(%NotEqual(one, "1"));
   assertFalse(%NotEqual("1", one));
+  assertTrue(%NotEqual(one, "a"));
+  assertTrue(%NotEqual("a", one));
 
   assertFalse(%NotEqual(one, {valueOf() { return true }}));
   assertFalse(%NotEqual({valueOf() { return true }}, one));
@@ -246,6 +266,8 @@ const six = BigInt(6);
   assertFalse("" != zero);
   assertFalse(one != "1");
   assertFalse("1" != one);
+  assertTrue(one != "a");
+  assertTrue("a" != one);
 
   assertFalse(one != {valueOf() { return true }});
   assertFalse({valueOf() { return true }} != one);
@@ -341,4 +363,163 @@ const six = BigInt(6);
 
   assertTrue(%SameValueZero(one, one));
   assertTrue(%SameValueZero(one, another_one));
+}
+
+// Abstract comparison
+{
+  let undef = Symbol();
+
+  assertTrue(%Equal(zero, zero));
+  assertTrue(%GreaterThanOrEqual(zero, zero));
+
+  assertTrue(%LessThan(zero, one));
+  assertTrue(%GreaterThan(one, zero));
+
+  assertTrue(%LessThan(minus_one, one));
+  assertTrue(%GreaterThan(one, minus_one));
+
+  assertTrue(%Equal(zero, -0));
+  assertTrue(%LessThanOrEqual(zero, -0));
+  assertTrue(%GreaterThanOrEqual(zero, -0));
+  assertTrue(%Equal(-0, zero));
+  assertTrue(%LessThanOrEqual(-0, zero));
+  assertTrue(%GreaterThanOrEqual(-0, zero));
+
+  assertTrue(%Equal(zero, 0));
+  assertTrue(%Equal(0, zero));
+
+  assertTrue(%LessThan(minus_one, 1));
+  assertTrue(%GreaterThan(1, minus_one));
+
+  assertFalse(%LessThan(six, NaN));
+  assertFalse(%GreaterThan(six, NaN));
+  assertFalse(%Equal(six, NaN));
+  assertFalse(%LessThan(NaN, six));
+  assertFalse(%GreaterThan(NaN, six));
+  assertFalse(%Equal(NaN, six));
+
+  assertTrue(%LessThan(six, Infinity));
+  assertTrue(%GreaterThan(Infinity, six));
+
+  assertTrue(%GreaterThan(six, -Infinity));
+  assertTrue(%LessThan(-Infinity, six));
+
+  assertTrue(%GreaterThan(six, 5.99999999));
+  assertTrue(%LessThan(5.99999999, six));
+
+  assertTrue(%Equal(zero, ""));
+  assertTrue(%LessThanOrEqual(zero, ""));
+  assertTrue(%GreaterThanOrEqual(zero, ""));
+  assertTrue(%Equal("", zero));
+  assertTrue(%LessThanOrEqual("", zero));
+  assertTrue(%GreaterThanOrEqual("", zero));
+
+  assertTrue(%Equal(minus_one, "\t-1 "));
+  assertTrue(%LessThanOrEqual(minus_one, "\t-1 "));
+  assertTrue(%GreaterThanOrEqual(minus_one, "\t-1 "));
+  assertTrue(%Equal("\t-1 ", minus_one));
+  assertTrue(%LessThanOrEqual("\t-1 ", minus_one));
+  assertTrue(%GreaterThanOrEqual("\t-1 ", minus_one));
+
+  assertFalse(%LessThan(minus_one, "-0x1"));
+  assertFalse(%GreaterThan(minus_one, "-0x1"));
+  assertFalse(%Equal(minus_one, "-0x1"));
+  assertFalse(%LessThan("-0x1", minus_one));
+  assertFalse(%GreaterThan("-0x1", minus_one));
+  assertFalse(%Equal("-0x1", minus_one));
+
+  const unsafe = "9007199254740993";  // 2**53 + 1
+  assertTrue(%GreaterThan(BigInt.parseInt(unsafe), unsafe));
+  assertTrue(%LessThan(unsafe, BigInt.parseInt(unsafe)));
+
+  assertThrows(() => %LessThan(six, Symbol(6)), TypeError);
+  assertThrows(() => %LessThan(Symbol(6), six), TypeError);
+
+  var value_five_string_six = {
+      valueOf() { return Object(5); },
+      toString() { return 6; }
+  };
+  assertTrue(%LessThanOrEqual(six, value_five_string_six));
+  assertTrue(%GreaterThanOrEqual(six, value_five_string_six));
+  assertTrue(%LessThanOrEqual(value_five_string_six, six));
+  assertTrue(%GreaterThanOrEqual(value_five_string_six, six));
+}{
+  assertFalse(zero < zero);
+  assertTrue(zero <= zero);
+
+  assertTrue(zero < one);
+  assertTrue(zero <= one);
+  assertFalse(one < zero);
+  assertFalse(one <= zero);
+
+  assertTrue(minus_one < one);
+  assertTrue(minus_one <= one);
+  assertFalse(one < minus_one);
+  assertFalse(one <= minus_one);
+
+  assertFalse(zero < -0);
+  assertTrue(zero <= -0);
+  assertFalse(-0 < zero);
+  assertTrue(-0 <= zero);
+
+  assertFalse(zero < 0);
+  assertTrue(zero <= 0);
+  assertFalse(0 < zero);
+  assertTrue(0 <= zero);
+
+  assertTrue(minus_one < 1);
+  assertTrue(minus_one <= 1);
+  assertFalse(1 < minus_one);
+  assertFalse(1 <= minus_one);
+
+  assertFalse(six < NaN);
+  assertFalse(six <= NaN);
+  assertFalse(NaN < six);
+  assertFalse(NaN <= six);
+
+  assertTrue(six < Infinity);
+  assertTrue(six <= Infinity);
+  assertFalse(Infinity < six);
+  assertFalse(Infinity <= six);
+
+  assertFalse(six < -Infinity);
+  assertFalse(six <= -Infinity);
+  assertTrue(-Infinity < six);
+  assertTrue(-Infinity <= six);
+
+  assertFalse(six < 5.99999999);
+  assertFalse(six <= 5.99999999);
+  assertTrue(5.99999999 < six);
+  assertTrue(5.99999999 <= six);
+
+  assertFalse(zero < "");
+  assertTrue(zero <= "");
+  assertFalse("" < zero);
+  assertTrue("" <= zero);
+
+  assertFalse(minus_one < "\t-1 ");
+  assertTrue(minus_one <= "\t-1 ");
+  assertFalse("\t-1 " < minus_one);
+  assertTrue("\t-1 " <= minus_one);
+
+  assertFalse(minus_one < "-0x1");
+  assertFalse(minus_one <= "-0x1");
+  assertFalse("-0x1" < minus_one);
+  assertFalse("-0x1" <= minus_one);
+
+  const unsafe = "9007199254740993";  // 2**53 + 1
+  assertFalse(BigInt.parseInt(unsafe) < unsafe);
+  assertFalse(BigInt.parseInt(unsafe) <= unsafe);
+  assertTrue(unsafe < BigInt.parseInt(unsafe));
+  assertTrue(unsafe <= BigInt.parseInt(unsafe));
+
+  assertThrows(() => six < Symbol(6), TypeError);
+  assertThrows(() => six <= Symbol(6), TypeError);
+  assertThrows(() => Symbol(6) < six, TypeError);
+  assertThrows(() => Symbol(6) <= six, TypeError);
+
+  assertFalse(six < {valueOf() {return Object(5)}, toString() {return 6}});
+  assertTrue(six <= {valueOf() {return Object(5)}, toString() {return 6}});
+  assertFalse({valueOf() {return Object(5)}, toString() {return 6}} < six);
+  assertTrue({valueOf() {return Object(5)}, toString() {return 6}} <= six);
 }

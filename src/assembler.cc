@@ -52,6 +52,7 @@
 #include "src/debug/debug.h"
 #include "src/deoptimizer.h"
 #include "src/disassembler.h"
+#include "src/elements.h"
 #include "src/execution.h"
 #include "src/ic/ic.h"
 #include "src/ic/stub-cache.h"
@@ -130,14 +131,14 @@ static struct V8_ALIGNED(16) {
 static struct V8_ALIGNED(16) {
   uint64_t a;
   uint64_t b;
-} double_absolute_constant = {V8_UINT64_C(0x7FFFFFFFFFFFFFFF),
-                              V8_UINT64_C(0x7FFFFFFFFFFFFFFF)};
+} double_absolute_constant = {uint64_t{0x7FFFFFFFFFFFFFFF},
+                              uint64_t{0x7FFFFFFFFFFFFFFF}};
 
 static struct V8_ALIGNED(16) {
   uint64_t a;
   uint64_t b;
-} double_negate_constant = {V8_UINT64_C(0x8000000000000000),
-                            V8_UINT64_C(0x8000000000000000)};
+} double_negate_constant = {uint64_t{0x8000000000000000},
+                            uint64_t{0x8000000000000000}};
 
 const char* const RelocInfo::kFillerCommentString = "DEOPTIMIZATION PADDING";
 
@@ -312,6 +313,18 @@ void RelocInfo::set_global_handle(Isolate* isolate, Address address,
   set_embedded_address(isolate, address, icache_flush_mode);
 }
 
+Address RelocInfo::wasm_call_address() const {
+  DCHECK_EQ(rmode_, WASM_CALL);
+  return Assembler::target_address_at(pc_, constant_pool_);
+}
+
+void RelocInfo::set_wasm_call_address(Isolate* isolate, Address address,
+                                      ICacheFlushMode icache_flush_mode) {
+  DCHECK_EQ(rmode_, WASM_CALL);
+  Assembler::set_target_address_at(isolate, pc_, constant_pool_, address,
+                                   icache_flush_mode);
+}
+
 Address RelocInfo::global_handle() const {
   DCHECK_EQ(rmode_, WASM_GLOBAL_HANDLE);
   return embedded_address();
@@ -337,8 +350,8 @@ void RelocInfo::update_wasm_function_table_size_reference(
 void RelocInfo::set_target_address(Isolate* isolate, Address target,
                                    WriteBarrierMode write_barrier_mode,
                                    ICacheFlushMode icache_flush_mode) {
-  DCHECK(IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_));
-  Assembler::set_target_address_at(isolate, pc_, host_, target,
+  DCHECK(IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_) || IsWasmCall(rmode_));
+  Assembler::set_target_address_at(isolate, pc_, constant_pool_, target,
                                    icache_flush_mode);
   if (write_barrier_mode == UPDATE_WRITE_BARRIER && host() != nullptr &&
       IsCodeTarget(rmode_)) {
@@ -431,8 +444,7 @@ void RelocInfoWriter::Write(const RelocInfo* rinfo) {
       WriteData(rinfo->data());
     } else if (RelocInfo::IsConstPool(rmode) ||
                RelocInfo::IsVeneerPool(rmode) || RelocInfo::IsDeoptId(rmode) ||
-               RelocInfo::IsDeoptPosition(rmode) ||
-               RelocInfo::IsWasmProtectedLanding(rmode)) {
+               RelocInfo::IsDeoptPosition(rmode)) {
       WriteIntData(static_cast<int>(rinfo->data()));
     }
   }
@@ -534,8 +546,7 @@ void RelocIterator::next() {
         } else if (RelocInfo::IsConstPool(rmode) ||
                    RelocInfo::IsVeneerPool(rmode) ||
                    RelocInfo::IsDeoptId(rmode) ||
-                   RelocInfo::IsDeoptPosition(rmode) ||
-                   RelocInfo::IsWasmProtectedLanding(rmode)) {
+                   RelocInfo::IsDeoptPosition(rmode)) {
           if (SetMode(rmode)) {
             AdvanceReadInt();
             return;
@@ -554,6 +565,7 @@ RelocIterator::RelocIterator(Code* code, int mode_mask) {
   rinfo_.host_ = code;
   rinfo_.pc_ = code->instruction_start();
   rinfo_.data_ = 0;
+  rinfo_.constant_pool_ = code->constant_pool();
   // Relocation info is read backwards.
   pos_ = code->relocation_start() + code->relocation_size();
   end_ = code->relocation_start();
@@ -569,6 +581,21 @@ RelocIterator::RelocIterator(const CodeDesc& desc, int mode_mask) {
   // Relocation info is read backwards.
   pos_ = desc.buffer + desc.buffer_size;
   end_ = pos_ - desc.reloc_size;
+  done_ = false;
+  mode_mask_ = mode_mask;
+  if (mode_mask_ == 0) pos_ = end_;
+  next();
+}
+
+RelocIterator::RelocIterator(Vector<byte> instructions,
+                             Vector<const byte> reloc_info, Address const_pool,
+                             int mode_mask) {
+  rinfo_.pc_ = instructions.start();
+  rinfo_.data_ = 0;
+  rinfo_.constant_pool_ = const_pool;
+  // Relocation info is read backwards.
+  pos_ = reloc_info.start() + reloc_info.size();
+  end_ = reloc_info.start();
   done_ = false;
   mode_mask_ = mode_mask;
   if (mode_mask_ == 0) pos_ = end_;
@@ -628,10 +655,12 @@ const char* RelocInfo::RelocModeName(RelocInfo::Mode rmode) {
       return "wasm context reference";
     case WASM_FUNCTION_TABLE_SIZE_REFERENCE:
       return "wasm function table size reference";
-    case WASM_PROTECTED_INSTRUCTION_LANDING:
-      return "wasm protected instruction landing";
     case WASM_GLOBAL_HANDLE:
       return "global handle";
+    case WASM_CALL:
+      return "internal wasm call";
+    case JS_TO_WASM_CALL:
+      return "js to wasm call";
     case NUMBER_OF_MODES:
     case PC_JUMP:
       UNREACHABLE();
@@ -713,8 +742,8 @@ void RelocInfo::Verify(Isolate* isolate) {
     case WASM_CONTEXT_REFERENCE:
     case WASM_FUNCTION_TABLE_SIZE_REFERENCE:
     case WASM_GLOBAL_HANDLE:
-    case WASM_PROTECTED_INSTRUCTION_LANDING:
-    // TODO(eholk): make sure the protected instruction is in range.
+    case WASM_CALL:
+    case JS_TO_WASM_CALL:
     case NONE32:
     case NONE64:
       break;
@@ -770,6 +799,16 @@ ExternalReference ExternalReference::isolate_address(Isolate* isolate) {
 
 ExternalReference ExternalReference::builtins_address(Isolate* isolate) {
   return ExternalReference(isolate->builtins()->builtins_table_address());
+}
+
+ExternalReference ExternalReference::handle_scope_implementer_address(
+    Isolate* isolate) {
+  return ExternalReference(isolate->handle_scope_implementer_address());
+}
+
+ExternalReference ExternalReference::pending_microtask_count_address(
+    Isolate* isolate) {
+  return ExternalReference(isolate->pending_microtask_count_address());
 }
 
 ExternalReference ExternalReference::interpreter_dispatch_table_address(
@@ -838,6 +877,10 @@ void ExternalReference::set_redirector(
 
 ExternalReference ExternalReference::stress_deopt_count(Isolate* isolate) {
   return ExternalReference(isolate->stress_deopt_count_address());
+}
+
+ExternalReference ExternalReference::force_slow_path(Isolate* isolate) {
+  return ExternalReference(isolate->force_slow_path_address());
 }
 
 ExternalReference ExternalReference::new_deoptimizer_function(
@@ -969,6 +1012,16 @@ ExternalReference ExternalReference::wasm_word64_popcnt(Isolate* isolate) {
       Redirect(isolate, FUNCTION_ADDR(wasm::word64_popcnt_wrapper)));
 }
 
+ExternalReference ExternalReference::wasm_word32_rol(Isolate* isolate) {
+  return ExternalReference(
+      Redirect(isolate, FUNCTION_ADDR(wasm::word32_rol_wrapper)));
+}
+
+ExternalReference ExternalReference::wasm_word32_ror(Isolate* isolate) {
+  return ExternalReference(
+      Redirect(isolate, FUNCTION_ADDR(wasm::word32_ror_wrapper)));
+}
+
 static void f64_acos_wrapper(double* param) {
   WriteDoubleValue(param, base::ieee754::acos(ReadDoubleValue(param)));
 }
@@ -1053,11 +1106,6 @@ ExternalReference ExternalReference::address_of_real_stack_limit(
 ExternalReference ExternalReference::address_of_regexp_stack_limit(
     Isolate* isolate) {
   return ExternalReference(isolate->regexp_stack()->limit_address());
-}
-
-ExternalReference ExternalReference::address_of_regexp_dotall_flag(
-    Isolate* isolate) {
-  return ExternalReference(&FLAG_harmony_regexp_dotall);
 }
 
 ExternalReference ExternalReference::store_buffer_top(Isolate* isolate) {
@@ -1397,6 +1445,26 @@ ExternalReference ExternalReference::get_or_create_hash_raw(Isolate* isolate) {
   return ExternalReference(Redirect(isolate, FUNCTION_ADDR(f)));
 }
 
+ExternalReference ExternalReference::jsreceiver_create_identity_hash(
+    Isolate* isolate) {
+  typedef Smi* (*CreateIdentityHash)(Isolate * isolate, JSReceiver * key);
+  CreateIdentityHash f = JSReceiver::CreateIdentityHash;
+  return ExternalReference(Redirect(isolate, FUNCTION_ADDR(f)));
+}
+
+ExternalReference
+ExternalReference::copy_fast_number_jsarray_elements_to_typed_array(
+    Isolate* isolate) {
+  return ExternalReference(Redirect(
+      isolate, FUNCTION_ADDR(CopyFastNumberJSArrayElementsToTypedArray)));
+}
+
+ExternalReference ExternalReference::copy_typed_array_elements_to_typed_array(
+    Isolate* isolate) {
+  return ExternalReference(
+      Redirect(isolate, FUNCTION_ADDR(CopyTypedArrayElementsToTypedArray)));
+}
+
 ExternalReference ExternalReference::try_internalize_string_function(
     Isolate* isolate) {
   return ExternalReference(Redirect(
@@ -1464,6 +1532,12 @@ ExternalReference ExternalReference::runtime_function_table_address(
     Isolate* isolate) {
   return ExternalReference(
       const_cast<Runtime::Function*>(Runtime::RuntimeFunctionTable(isolate)));
+}
+
+ExternalReference ExternalReference::invalidate_prototype_chains_function(
+    Isolate* isolate) {
+  return ExternalReference(
+      Redirect(isolate, FUNCTION_ADDR(JSObject::InvalidatePrototypeChains)));
 }
 
 double power_helper(Isolate* isolate, double x, double y) {

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --stack-size=100 --harmony
+// Flags: --allow-natives-syntax --stack-size=100 --harmony
 
 function test(f, expected, type) {
   try {
@@ -14,6 +14,18 @@ function test(f, expected, type) {
   }
   assertUnreachable("Exception expected");
 }
+
+const typedArrayConstructors = [
+  Uint8Array,
+  Int8Array,
+  Uint16Array,
+  Int16Array,
+  Uint32Array,
+  Int32Array,
+  Float32Array,
+  Float64Array,
+  Uint8ClampedArray
+];
 
 // === Error ===
 
@@ -124,8 +136,24 @@ test(function() {
 
 // kConstructorNotFunction
 test(function() {
+  Map();
+}, "Constructor Map requires 'new'", TypeError);
+
+test(function() {
+  Set();
+}, "Constructor Set requires 'new'", TypeError);
+
+test(function() {
   Uint16Array(1);
 }, "Constructor Uint16Array requires 'new'", TypeError);
+
+test(function() {
+  WeakSet();
+}, "Constructor WeakSet requires 'new'", TypeError);
+
+test(function() {
+  WeakMap();
+}, "Constructor WeakMap requires 'new'", TypeError);
 
 // kDataViewNotArrayBuffer
 test(function() {
@@ -139,6 +167,21 @@ test(function() {
   Object.preventExtensions(o);
   Object.defineProperty(o, "x", { value: 1 });
 }, "Cannot define property x, object is not extensible", TypeError);
+
+// kDetachedOperation
+for (constructor of typedArrayConstructors) {
+  test(() => {
+    const ta = new constructor([1]);
+    %ArrayBufferNeuter(ta.buffer);
+    ta.find(() => {});
+  }, "Cannot perform %TypedArray%.prototype.find on a detached ArrayBuffer", TypeError);
+
+  test(() => {
+    const ta = new constructor([1]);
+    %ArrayBufferNeuter(ta.buffer);
+    ta.findIndex(() => {});
+  }, "Cannot perform %TypedArray%.prototype.findIndex on a detached ArrayBuffer", TypeError);
+}
 
 // kFirstArgumentNotRegExp
 test(function() {
@@ -175,6 +218,26 @@ test(function() {
 }, "Method Set.prototype.add called on incompatible receiver [object Array]",
 TypeError);
 
+test(function() {
+  WeakSet.prototype.add.call([]);
+}, "Method WeakSet.prototype.add called on incompatible receiver [object Array]",
+TypeError);
+
+test(function() {
+  WeakSet.prototype.delete.call([]);
+}, "Method WeakSet.prototype.delete called on incompatible receiver [object Array]",
+TypeError);
+
+test(function() {
+  WeakMap.prototype.set.call([]);
+}, "Method WeakMap.prototype.set called on incompatible receiver [object Array]",
+TypeError);
+
+test(function() {
+  WeakMap.prototype.delete.call([]);
+}, "Method WeakMap.prototype.delete called on incompatible receiver [object Array]",
+TypeError);
+
 // kNonCallableInInstanceOfCheck
 test(function() {
   1 instanceof {};
@@ -197,6 +260,24 @@ test(function() {
 test(function() {
   1 in 1;
 }, "Cannot use 'in' operator to search for '1' in 1", TypeError);
+
+// kInvalidWeakMapKey
+test(function() {
+  new WeakMap([[1, 1]]);
+}, "Invalid value used as weak map key", TypeError);
+
+test(function() {
+  new WeakMap().set(1, 1);
+}, "Invalid value used as weak map key", TypeError);
+
+// kInvalidWeakSetValue
+test(function() {
+  new WeakSet([1]);
+}, "Invalid value used in weak set", TypeError);
+
+test(function() {
+  new WeakSet().add(1);
+}, "Invalid value used in weak set", TypeError);
 
 // kIteratorResultNotAnObject
 test(function() {
@@ -289,9 +370,24 @@ test(function() {
 
 // kPropertyNotFunction
 test(function() {
+  Map.prototype.set = 0;
+  new Map([[1, 2]]);
+}, "'0' returned for property 'set' of object '#<Map>' is not a function", TypeError);
+
+test(function() {
   Set.prototype.add = 0;
-  new Set(1);
+  new Set([1]);
 }, "'0' returned for property 'add' of object '#<Set>' is not a function", TypeError);
+
+test(function() {
+  WeakMap.prototype.set = 0;
+  new WeakMap([[{}, 1]]);
+}, "'0' returned for property 'set' of object '#<WeakMap>' is not a function", TypeError);
+
+test(function() {
+  WeakSet.prototype.add = 0;
+  new WeakSet([{}]);
+}, "'0' returned for property 'add' of object '#<WeakSet>' is not a function", TypeError);
 
 // kProtoObjectOrNull
 test(function() {

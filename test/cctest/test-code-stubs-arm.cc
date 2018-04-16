@@ -45,14 +45,13 @@ namespace internal {
 
 ConvertDToIFunc MakeConvertDToIFuncTrampoline(Isolate* isolate,
                                               Register destination_reg) {
-  // Allocate an executable page of memory.
-  size_t actual_size;
-  byte* buffer = static_cast<byte*>(v8::base::OS::Allocate(
-      Assembler::kMinimalBufferSize, &actual_size, true));
-  CHECK(buffer);
   HandleScope handles(isolate);
-  MacroAssembler masm(isolate, buffer, static_cast<int>(actual_size),
+
+  size_t allocated;
+  byte* buffer = AllocateAssemblerBuffer(&allocated);
+  MacroAssembler masm(isolate, buffer, static_cast<int>(allocated),
                       v8::internal::CodeObjectRequired::kYes);
+
   DoubleToIStub stub(isolate, destination_reg);
 
   byte* start = stub.GetCode()->instruction_start();
@@ -98,7 +97,7 @@ ConvertDToIFunc MakeConvertDToIFuncTrampoline(Isolate* isolate,
       if (reg != destination_reg) {
         __ ldr(ip, MemOperand(sp, 0));
         __ cmp(reg, ip);
-        __ Assert(eq, kRegisterWasClobbered);
+        __ Assert(eq, AbortReason::kRegisterWasClobbered);
         __ add(sp, sp, Operand(kPointerSize));
       }
     }
@@ -116,7 +115,8 @@ ConvertDToIFunc MakeConvertDToIFuncTrampoline(Isolate* isolate,
 
   CodeDesc desc;
   masm.GetCode(isolate, &desc);
-  Assembler::FlushICache(isolate, buffer, actual_size);
+  MakeAssemblerBufferExecutable(buffer, allocated);
+  Assembler::FlushICache(isolate, buffer, allocated);
   return (reinterpret_cast<ConvertDToIFunc>(
       reinterpret_cast<intptr_t>(buffer)));
 }
@@ -132,7 +132,8 @@ static Isolate* GetIsolateFrom(LocalContext* context) {
 int32_t RunGeneratedCodeCallWrapper(ConvertDToIFunc func,
                                     double from) {
 #ifdef USE_SIMULATOR
-  return CALL_GENERATED_FP_INT(CcTest::i_isolate(), func, from, 0);
+  return Simulator::current(CcTest::i_isolate())
+      ->CallFP<int32_t>(FUNCTION_ADDR(func), from, 0);
 #else
   return (*func)(from);
 #endif

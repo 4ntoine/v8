@@ -6,6 +6,7 @@
 #define V8_OBJECTS_JS_ARRAY_H_
 
 #include "src/objects.h"
+#include "src/objects/fixed-array.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -179,7 +180,19 @@ class JSArrayBuffer : public JSObject {
 
   inline ArrayBuffer::Allocator::AllocationMode allocation_mode() const;
 
+  struct Allocation {
+    using AllocationMode = ArrayBuffer::Allocator::AllocationMode;
+
+    Allocation(void* allocation_base, size_t length, AllocationMode mode)
+        : allocation_base(allocation_base), length(length), mode(mode) {}
+
+    void* allocation_base;
+    size_t length;
+    AllocationMode mode;
+  };
+
   void FreeBackingStore();
+  static void FreeBackingStore(Isolate* isolate, Allocation allocation);
 
   V8_EXPORT_PRIVATE static void Setup(
       Handle<JSArrayBuffer> array_buffer, Isolate* isolate, bool is_external,
@@ -213,7 +226,7 @@ class JSArrayBuffer : public JSObject {
 #if V8_TARGET_LITTLE_ENDIAN || !V8_HOST_ARCH_64_BIT
   static const int kBitFieldOffset = kBitFieldSlot;
 #else
-  static const int kBitFieldOffset = kBitFieldSlot + kIntSize;
+  static const int kBitFieldOffset = kBitFieldSlot + kInt32Size;
 #endif
   static const int kSize = kBitFieldSlot + kPointerSize;
 
@@ -286,9 +299,12 @@ class JSTypedArray : public JSArrayBufferView {
 
   Handle<JSArrayBuffer> GetBuffer();
 
+  inline bool HasJSTypedArrayPrototype(Isolate* isolate);
   static inline MaybeHandle<JSTypedArray> Validate(Isolate* isolate,
                                                    Handle<Object> receiver,
                                                    const char* method_name);
+  static inline Handle<JSFunction> DefaultConstructor(
+      Isolate* isolate, Handle<JSTypedArray> exemplar);
   // ES7 section 22.2.4.6 Create ( constructor, argumentList )
   static MaybeHandle<JSTypedArray> Create(Isolate* isolate,
                                           Handle<Object> default_ctor, int argc,

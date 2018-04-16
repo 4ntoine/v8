@@ -214,5 +214,50 @@ RUNTIME_FUNCTION(Runtime_TypedArraySpeciesCreateByLength) {
   return *result_array;
 }
 
+// 22.2.3.23 %TypedArray%.prototype.set ( overloaded [ , offset ] )
+RUNTIME_FUNCTION(Runtime_TypedArraySet) {
+  HandleScope scope(isolate);
+  Handle<JSTypedArray> target = args.at<JSTypedArray>(0);
+  Handle<Object> obj = args.at(1);
+  Handle<Smi> offset = args.at<Smi>(2);
+
+  DCHECK(!target->WasNeutered());  // Checked in TypedArrayPrototypeSet.
+  DCHECK(!obj->IsJSTypedArray());  // Should be handled by CSA.
+  DCHECK_LE(0, offset->value());
+
+  const uint32_t uint_offset = static_cast<uint32_t>(offset->value());
+
+  if (obj->IsNumber()) {
+    // For number as a first argument, throw TypeError
+    // instead of silently ignoring the call, so that
+    // users know they did something wrong.
+    // (Consistent with Firefox and Blink/WebKit)
+    THROW_NEW_ERROR_RETURN_FAILURE(
+        isolate, NewTypeError(MessageTemplate::kInvalidArgument));
+  }
+
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(isolate, obj,
+                                     Object::ToObject(isolate, obj));
+
+  Handle<Object> len;
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+      isolate, len,
+      Object::GetProperty(obj, isolate->factory()->length_string()));
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(isolate, len,
+                                     Object::ToLength(isolate, len));
+
+  if (uint_offset + len->Number() > target->length_value()) {
+    THROW_NEW_ERROR_RETURN_FAILURE(
+        isolate, NewRangeError(MessageTemplate::kTypedArraySetSourceTooLarge));
+  }
+
+  uint32_t int_l;
+  CHECK(DoubleToUint32IfEqualToSelf(len->Number(), &int_l));
+
+  Handle<JSReceiver> source = Handle<JSReceiver>::cast(obj);
+  ElementsAccessor* accessor = target->GetElementsAccessor();
+  return accessor->CopyElements(source, target, int_l, uint_offset);
+}
+
 }  // namespace internal
 }  // namespace v8

@@ -437,11 +437,6 @@ class String : public Name {
   static Handle<FixedArray> CalculateLineEnds(Handle<String> string,
                                               bool include_ending_line);
 
-  // Use the hash field to forward to the canonical internalized string
-  // when deserializing an internalized string.
-  inline void SetForwardedInternalizedString(String* string);
-  inline String* GetForwardedInternalizedString();
-
  private:
   friend class Name;
   friend class StringTableInsertionKey;
@@ -515,7 +510,8 @@ class SeqOneByteString : public SeqString {
   }
 
   // Maximal memory usage for a single sequential one-byte string.
-  static const int kMaxSize = OBJECT_POINTER_ALIGN(kMaxLength + kHeaderSize);
+  static const int kMaxCharsSize = kMaxLength;
+  static const int kMaxSize = OBJECT_POINTER_ALIGN(kMaxCharsSize + kHeaderSize);
   STATIC_ASSERT((kMaxSize - kHeaderSize) >= String::kMaxLength);
 
   class BodyDescriptor;
@@ -561,8 +557,8 @@ class SeqTwoByteString : public SeqString {
   }
 
   // Maximal memory usage for a single sequential two-byte string.
-  static const int kMaxSize =
-      OBJECT_POINTER_ALIGN(kMaxLength * 2 + kHeaderSize);
+  static const int kMaxCharsSize = kMaxLength * 2;
+  static const int kMaxSize = OBJECT_POINTER_ALIGN(kMaxCharsSize + kHeaderSize);
   STATIC_ASSERT(static_cast<int>((kMaxSize - kHeaderSize) / sizeof(uint16_t)) >=
                 String::kMaxLength);
 
@@ -635,6 +631,7 @@ class ThinString : public String {
  public:
   // Actual string that this ThinString refers to.
   inline String* actual() const;
+  inline HeapObject* unchecked_actual() const;
   inline void set_actual(String* s,
                          WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
@@ -721,6 +718,12 @@ class ExternalString : public String {
 
   // Return whether external string is short (data pointer is not cached).
   inline bool is_short();
+
+  // Used in the serializer/deserializer.
+  inline Address resource_as_address();
+  inline void set_address_as_resource(Address address);
+  inline uint32_t resource_as_uint32();
+  inline void set_uint32_as_resource(uint32_t value);
 
   STATIC_ASSERT(kResourceOffset == Internals::kStringResourceOffset);
 

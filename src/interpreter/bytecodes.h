@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <iosfwd>
 #include <string>
+#include <vector>
 
 #include "src/globals.h"
 #include "src/interpreter/bytecode-operands.h"
@@ -41,10 +42,7 @@ namespace interpreter {
   V(LdaGlobal, AccumulatorUse::kWrite, OperandType::kIdx, OperandType::kIdx)   \
   V(LdaGlobalInsideTypeof, AccumulatorUse::kWrite, OperandType::kIdx,          \
     OperandType::kIdx)                                                         \
-  V(StaGlobalSloppy, AccumulatorUse::kRead, OperandType::kIdx,                 \
-    OperandType::kIdx)                                                         \
-  V(StaGlobalStrict, AccumulatorUse::kRead, OperandType::kIdx,                 \
-    OperandType::kIdx)                                                         \
+  V(StaGlobal, AccumulatorUse::kRead, OperandType::kIdx, OperandType::kIdx)    \
                                                                                \
   /* Context operations */                                                     \
   V(PushContext, AccumulatorUse::kRead, OperandType::kRegOut)                  \
@@ -93,11 +91,11 @@ namespace interpreter {
     OperandType::kUImm)                                                        \
                                                                                \
   /* Propery stores (StoreIC) operations */                                    \
-  V(StaNamedProperty, AccumulatorUse::kRead, OperandType::kReg,                \
+  V(StaNamedProperty, AccumulatorUse::kReadWrite, OperandType::kReg,           \
     OperandType::kIdx, OperandType::kIdx)                                      \
-  V(StaNamedOwnProperty, AccumulatorUse::kRead, OperandType::kReg,             \
+  V(StaNamedOwnProperty, AccumulatorUse::kReadWrite, OperandType::kReg,        \
     OperandType::kIdx, OperandType::kIdx)                                      \
-  V(StaKeyedProperty, AccumulatorUse::kRead, OperandType::kReg,                \
+  V(StaKeyedProperty, AccumulatorUse::kReadWrite, OperandType::kReg,           \
     OperandType::kReg, OperandType::kIdx)                                      \
   V(StaDataPropertyInLiteral, AccumulatorUse::kRead, OperandType::kReg,        \
     OperandType::kReg, OperandType::kFlag8, OperandType::kIdx)                 \
@@ -109,6 +107,7 @@ namespace interpreter {
   V(Mul, AccumulatorUse::kReadWrite, OperandType::kReg, OperandType::kIdx)     \
   V(Div, AccumulatorUse::kReadWrite, OperandType::kReg, OperandType::kIdx)     \
   V(Mod, AccumulatorUse::kReadWrite, OperandType::kReg, OperandType::kIdx)     \
+  V(Exp, AccumulatorUse::kReadWrite, OperandType::kReg, OperandType::kIdx)     \
   V(BitwiseOr, AccumulatorUse::kReadWrite, OperandType::kReg,                  \
     OperandType::kIdx)                                                         \
   V(BitwiseXor, AccumulatorUse::kReadWrite, OperandType::kReg,                 \
@@ -128,6 +127,7 @@ namespace interpreter {
   V(MulSmi, AccumulatorUse::kReadWrite, OperandType::kImm, OperandType::kIdx)  \
   V(DivSmi, AccumulatorUse::kReadWrite, OperandType::kImm, OperandType::kIdx)  \
   V(ModSmi, AccumulatorUse::kReadWrite, OperandType::kImm, OperandType::kIdx)  \
+  V(ExpSmi, AccumulatorUse::kReadWrite, OperandType::kImm, OperandType::kIdx)  \
   V(BitwiseOrSmi, AccumulatorUse::kReadWrite, OperandType::kImm,               \
     OperandType::kIdx)                                                         \
   V(BitwiseXorSmi, AccumulatorUse::kReadWrite, OperandType::kImm,              \
@@ -317,27 +317,28 @@ namespace interpreter {
   V(RestoreGeneratorState, AccumulatorUse::kWrite, OperandType::kReg)          \
   V(SuspendGenerator, AccumulatorUse::kNone, OperandType::kReg,                \
     OperandType::kRegList, OperandType::kRegCount, OperandType::kUImm)         \
-  V(RestoreGeneratorRegisters, AccumulatorUse::kNone, OperandType::kReg,       \
-    OperandType::kRegOutList, OperandType::kRegCount)                          \
+  V(ResumeGenerator, AccumulatorUse::kWrite, OperandType::kReg,                \
+    OperandType::kRegOut, OperandType::kRegOutList, OperandType::kRegCount)    \
                                                                                \
   /* Debugger */                                                               \
   V(Debugger, AccumulatorUse::kNone)                                           \
                                                                                \
   /* Debug Breakpoints - one for each possible size of unscaled bytecodes */   \
   /* and one for each operand widening prefix bytecode                    */   \
-  V(DebugBreak0, AccumulatorUse::kRead)                                        \
-  V(DebugBreak1, AccumulatorUse::kRead, OperandType::kReg)                     \
-  V(DebugBreak2, AccumulatorUse::kRead, OperandType::kReg, OperandType::kReg)  \
-  V(DebugBreak3, AccumulatorUse::kRead, OperandType::kReg, OperandType::kReg,  \
+  V(DebugBreak0, AccumulatorUse::kReadWrite)                                   \
+  V(DebugBreak1, AccumulatorUse::kReadWrite, OperandType::kReg)                \
+  V(DebugBreak2, AccumulatorUse::kReadWrite, OperandType::kReg,                \
     OperandType::kReg)                                                         \
-  V(DebugBreak4, AccumulatorUse::kRead, OperandType::kReg, OperandType::kReg,  \
+  V(DebugBreak3, AccumulatorUse::kReadWrite, OperandType::kReg,                \
     OperandType::kReg, OperandType::kReg)                                      \
-  V(DebugBreak5, AccumulatorUse::kRead, OperandType::kRuntimeId,               \
-    OperandType::kReg, OperandType::kReg)                                      \
-  V(DebugBreak6, AccumulatorUse::kRead, OperandType::kRuntimeId,               \
+  V(DebugBreak4, AccumulatorUse::kReadWrite, OperandType::kReg,                \
     OperandType::kReg, OperandType::kReg, OperandType::kReg)                   \
-  V(DebugBreakWide, AccumulatorUse::kRead)                                     \
-  V(DebugBreakExtraWide, AccumulatorUse::kRead)                                \
+  V(DebugBreak5, AccumulatorUse::kReadWrite, OperandType::kRuntimeId,          \
+    OperandType::kReg, OperandType::kReg)                                      \
+  V(DebugBreak6, AccumulatorUse::kReadWrite, OperandType::kRuntimeId,          \
+    OperandType::kReg, OperandType::kReg, OperandType::kReg)                   \
+  V(DebugBreakWide, AccumulatorUse::kReadWrite)                                \
+  V(DebugBreakExtraWide, AccumulatorUse::kReadWrite)                           \
                                                                                \
   /* Block Coverage */                                                         \
   V(IncBlockCounter, AccumulatorUse::kNone, OperandType::kIdx)                 \
@@ -443,7 +444,7 @@ enum class Bytecode : uint8_t {
 #undef COUNT_BYTECODE
 };
 
-class V8_EXPORT_PRIVATE Bytecodes final {
+class V8_EXPORT_PRIVATE Bytecodes final : public AllStatic {
  public:
   // The maximum number of operands a bytecode may have.
   static const int kMaxOperands = 5;
@@ -672,6 +673,12 @@ class V8_EXPORT_PRIVATE Bytecodes final {
     return bytecode == Bytecode::kExtraWide || bytecode == Bytecode::kWide ||
            bytecode == Bytecode::kDebugBreakExtraWide ||
            bytecode == Bytecode::kDebugBreakWide;
+  }
+
+  // Returns true if the bytecode can be lazily deserialized.
+  static constexpr bool IsLazy(Bytecode bytecode) {
+    // Currently, all handlers are deserialized lazily.
+    return true;
   }
 
   // Returns the number of values which |bytecode| returns.

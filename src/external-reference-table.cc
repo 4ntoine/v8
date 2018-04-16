@@ -8,7 +8,6 @@
 #include "src/assembler.h"
 #include "src/counters.h"
 #include "src/ic/stub-cache.h"
-#include "src/trap-handler/trap-handler.h"
 
 #if defined(DEBUG) && defined(V8_OS_LINUX) && !defined(V8_OS_ANDROID)
 #define SYMBOLIZE_FUNCTION
@@ -93,6 +92,10 @@ void ExternalReferenceTable::AddReferences(Isolate* isolate) {
       "LDoubleConstant::one_half");
   Add(ExternalReference::isolate_address(isolate).address(), "isolate");
   Add(ExternalReference::builtins_address(isolate).address(), "builtins");
+  Add(ExternalReference::handle_scope_implementer_address(isolate).address(),
+      "Isolate::handle_scope_implementer_address");
+  Add(ExternalReference::pending_microtask_count_address(isolate).address(),
+      "Isolate::pending_microtask_count_address()");
   Add(ExternalReference::interpreter_dispatch_table_address(isolate).address(),
       "Interpreter::dispatch_table_address");
   Add(ExternalReference::bytecode_size_table_address(isolate).address(),
@@ -269,6 +272,15 @@ void ExternalReferenceTable::AddReferences(Isolate* isolate) {
       "orderedhashmap_gethash_raw");
   Add(ExternalReference::get_or_create_hash_raw(isolate).address(),
       "get_or_create_hash_raw");
+  Add(ExternalReference::jsreceiver_create_identity_hash(isolate).address(),
+      "jsreceiver_create_identity_hash");
+  Add(ExternalReference::copy_fast_number_jsarray_elements_to_typed_array(
+          isolate)
+          .address(),
+      "copy_fast_number_jsarray_elements_to_typed_array");
+  Add(ExternalReference::copy_typed_array_elements_to_typed_array(isolate)
+          .address(),
+      "copy_typed_array_elements_to_typed_array");
   Add(ExternalReference::log_enter_external_function(isolate).address(),
       "Logger::EnterExternal");
   Add(ExternalReference::log_leave_external_function(isolate).address(),
@@ -277,6 +289,8 @@ void ExternalReferenceTable::AddReferences(Isolate* isolate) {
       "double_constants.minus_one_half");
   Add(ExternalReference::stress_deopt_count(isolate).address(),
       "Isolate::stress_deopt_count_address()");
+  Add(ExternalReference::force_slow_path(isolate).address(),
+      "Isolate::force_slow_path_address()");
   Add(ExternalReference::runtime_function_table_address(isolate).address(),
       "Runtime::runtime_function_table_address()");
   Add(ExternalReference::address_of_float_abs_constant().address(),
@@ -302,9 +316,6 @@ void ExternalReferenceTable::AddReferences(Isolate* isolate) {
       "Debug::step_suspended_generator_address()");
   Add(ExternalReference::debug_restart_fp_address(isolate).address(),
       "Debug::restart_fp_address()");
-
-  Add(ExternalReference::address_of_regexp_dotall_flag(isolate).address(),
-      "FLAG_harmony_regexp_dotall");
 
 #ifndef V8_INTERPRETED_REGEXP
   Add(ExternalReference::re_case_insensitive_compare_uc16(isolate).address(),
@@ -334,6 +345,10 @@ void ExternalReferenceTable::AddReferences(Isolate* isolate) {
       "IncrementalMarking::RecordWrite");
   Add(ExternalReference::store_buffer_overflow_function(isolate).address(),
       "StoreBuffer::StoreBufferOverflow");
+
+  Add(ExternalReference::invalidate_prototype_chains_function(isolate)
+          .address(),
+      "JSObject::InvalidatePrototypeChains()");
 }
 
 void ExternalReferenceTable::AddBuiltins(Isolate* isolate) {
@@ -392,8 +407,9 @@ void ExternalReferenceTable::AddAccessors(Isolate* isolate) {
   };
 
   static const AccessorRefTable getters[] = {
-#define ACCESSOR_INFO_DECLARATION(name) \
-  {FUNCTION_ADDR(&Accessors::name##Getter), "Accessors::" #name "Getter"},
+#define ACCESSOR_INFO_DECLARATION(accessor_name, AccessorName) \
+  {FUNCTION_ADDR(&Accessors::AccessorName##Getter),            \
+   "Accessors::" #AccessorName "Getter"}, /* NOLINT(whitespace/indent) */
       ACCESSOR_INFO_LIST(ACCESSOR_INFO_DECLARATION)
 #undef ACCESSOR_INFO_DECLARATION
   };
@@ -401,7 +417,7 @@ void ExternalReferenceTable::AddAccessors(Isolate* isolate) {
 #define ACCESSOR_SETTER_DECLARATION(name) \
   { FUNCTION_ADDR(&Accessors::name), "Accessors::" #name},
       ACCESSOR_SETTER_LIST(ACCESSOR_SETTER_DECLARATION)
-#undef ACCESSOR_INFO_DECLARATION
+#undef ACCESSOR_SETTER_DECLARATION
   };
 
   for (unsigned i = 0; i < arraysize(getters); ++i) {
@@ -449,3 +465,5 @@ void ExternalReferenceTable::AddStubCache(Isolate* isolate) {
 
 }  // namespace internal
 }  // namespace v8
+
+#undef SYMBOLIZE_FUNCTION

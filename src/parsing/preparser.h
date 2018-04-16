@@ -303,6 +303,7 @@ class PreParserExpression {
 
   int position() const { return kNoSourcePosition; }
   void set_function_token_position(int position) {}
+  void set_scope(Scope* scope) {}
 
  private:
   enum Type {
@@ -604,7 +605,7 @@ class PreParserFactory {
     return PreParserExpression::Default();
   }
   PreParserExpression NewRewritableExpression(
-      const PreParserExpression& expression) {
+      const PreParserExpression& expression, Scope* scope) {
     return expression;
   }
   PreParserExpression NewAssignment(Token::Value op,
@@ -831,6 +832,7 @@ struct ParserTypes<PreParser> {
   typedef PreParserExpression ObjectLiteralProperty;
   typedef PreParserExpression ClassLiteralProperty;
   typedef PreParserExpression Suspend;
+  typedef PreParserExpression RewritableExpression;
   typedef PreParserExpressionList ExpressionList;
   typedef PreParserExpressionList ObjectPropertyList;
   typedef PreParserExpressionList ClassPropertyList;
@@ -880,14 +882,15 @@ class PreParser : public ParserBase<PreParser> {
   PreParser(Zone* zone, Scanner* scanner, uintptr_t stack_limit,
             AstValueFactory* ast_value_factory,
             PendingCompilationErrorHandler* pending_error_handler,
-            RuntimeCallStats* runtime_call_stats, bool parsing_module = false,
+            RuntimeCallStats* runtime_call_stats, Logger* logger,
+            int script_id = -1, bool parsing_module = false,
             bool parsing_on_main_thread = true)
       : ParserBase<PreParser>(zone, scanner, stack_limit, nullptr,
-                              ast_value_factory, runtime_call_stats,
+                              ast_value_factory, pending_error_handler,
+                              runtime_call_stats, logger, script_id,
                               parsing_module, parsing_on_main_thread),
         use_counts_(nullptr),
         track_unresolved_variables_(false),
-        pending_error_handler_(pending_error_handler),
         produced_preparsed_scope_data_(nullptr) {}
 
   static bool IsPreParser() { return true; }
@@ -913,7 +916,8 @@ class PreParser : public ParserBase<PreParser> {
       FunctionLiteral::FunctionType function_type,
       DeclarationScope* function_scope, bool track_unresolved_variables,
       bool may_abort, int* use_counts,
-      ProducedPreParsedScopeData** produced_preparser_scope_data);
+      ProducedPreParsedScopeData** produced_preparser_scope_data,
+      int script_id);
 
   ProducedPreParsedScopeData* produced_preparsed_scope_data() const {
     return produced_preparsed_scope_data_;
@@ -940,6 +944,10 @@ class PreParser : public ParserBase<PreParser> {
   bool AllowsLazyParsingWithoutUnresolvedVariables() const { return false; }
   bool parse_lazily() const { return false; }
 
+  PendingCompilationErrorHandler* pending_error_handler() {
+    return pending_error_handler_;
+  }
+
   V8_INLINE LazyParsingResult
   SkipFunction(const AstRawString* name, FunctionKind kind,
                FunctionLiteral::FunctionType function_type,
@@ -948,11 +956,18 @@ class PreParser : public ParserBase<PreParser> {
                bool is_inner_function, bool may_abort, bool* ok) {
     UNREACHABLE();
   }
+
   Expression ParseFunctionLiteral(
       Identifier name, Scanner::Location function_name_location,
       FunctionNameValidity function_name_validity, FunctionKind kind,
       int function_token_pos, FunctionLiteral::FunctionType function_type,
-      LanguageMode language_mode, bool* ok);
+      LanguageMode language_mode,
+      ZoneList<const AstRawString*>* arguments_for_wrapped_function, bool* ok);
+
+  PreParserExpression InitializeObjectLiteral(PreParserExpression literal) {
+    return literal;
+  }
+
   LazyParsingResult ParseStatementListAndLogFunction(
       PreParserFormalParameters* formals, bool maybe_abort, bool* ok);
 
@@ -986,22 +1001,10 @@ class PreParser : public ParserBase<PreParser> {
 
   V8_INLINE void RewriteDestructuringAssignments() {}
 
-  V8_INLINE PreParserExpression
-  RewriteExponentiation(const PreParserExpression& left,
-                        const PreParserExpression& right, int pos) {
-    return left;
-  }
-  V8_INLINE PreParserExpression
-  RewriteAssignExponentiation(const PreParserExpression& left,
-                              const PreParserExpression& right, int pos) {
-    return left;
-  }
-
   V8_INLINE void PrepareGeneratorVariables() {}
   V8_INLINE void RewriteAsyncFunctionBody(
       PreParserStatementList body, PreParserStatement block,
       const PreParserExpression& return_value, bool* ok) {}
-  V8_INLINE void RewriteNonPattern(bool* ok) { ValidateExpression(ok); }
 
   void DeclareAndInitializeVariables(
       PreParserStatement block,
@@ -1064,27 +1067,24 @@ class PreParser : public ParserBase<PreParser> {
       int pos, FunctionKind kind, PreParserStatementList body, bool* ok) {
     ParseStatementList(body, Token::RBRACE, ok);
   }
-  V8_INLINE void CreateFunctionNameAssignment(
+  V8_INLINE void DeclareFunctionNameVar(
       const AstRawString* function_name,
       FunctionLiteral::FunctionType function_type,
       DeclarationScope* function_scope) {
     if (track_unresolved_variables_ &&
-        function_type == FunctionLiteral::kNamedExpression) {
-      if (function_scope->LookupLocal(function_name) == nullptr) {
-        DCHECK_EQ(function_scope, scope());
-        Variable* fvar = function_scope->DeclareFunctionVar(function_name);
-        fvar->set_is_used();
-      }
+        function_type == FunctionLiteral::kNamedExpression &&
+        function_scope->LookupLocal(function_name) == nullptr) {
+      DCHECK_EQ(function_scope, scope());
+      function_scope->DeclareFunctionVar(function_name);
     }
   }
 
-  V8_INLINE void CreateFunctionNameAssignment(
-      const PreParserIdentifier& function_name, int pos,
+  V8_INLINE void DeclareFunctionNameVar(
+      const PreParserIdentifier& function_name,
       FunctionLiteral::FunctionType function_type,
-      DeclarationScope* function_scope, PreParserStatementList result,
-      int index) {
-    CreateFunctionNameAssignment(function_name.string_, function_type,
-                                 function_scope);
+      DeclarationScope* function_scope) {
+    DeclareFunctionNameVar(function_name.string_, function_type,
+                           function_scope);
   }
 
   V8_INLINE PreParserExpression RewriteDoExpression(PreParserStatement body,
@@ -1144,7 +1144,16 @@ class PreParser : public ParserBase<PreParser> {
                                       const PreParserExpression& property,
                                       ClassLiteralProperty::Kind kind,
                                       bool is_static, bool is_constructor,
-                                      ClassInfo* class_info, bool* ok) {}
+                                      bool is_computed_name,
+                                      ClassInfo* class_info, bool* ok) {
+    if (kind == ClassLiteralProperty::FIELD && is_computed_name) {
+      scope()->DeclareVariableName(
+          ClassFieldVariableName(ast_value_factory(),
+                                 class_info->computed_field_count),
+          CONST);
+    }
+  }
+
   V8_INLINE PreParserExpression
   RewriteClassLiteral(Scope* scope, const PreParserIdentifier& name,
                       ClassInfo* class_info, int pos, int end_pos, bool* ok) {
@@ -1166,6 +1175,12 @@ class PreParser : public ParserBase<PreParser> {
       FunctionState function_state(&function_state_, &scope_, function_scope);
       GetNextFunctionLiteralId();
     }
+    if (class_info->has_static_class_fields) {
+      GetNextFunctionLiteralId();
+    }
+    if (class_info->has_instance_class_fields) {
+      GetNextFunctionLiteralId();
+    }
     return PreParserExpression::Default();
   }
 
@@ -1176,8 +1191,6 @@ class PreParser : public ParserBase<PreParser> {
 
   V8_INLINE void QueueDestructuringAssignmentForRewriting(
       PreParserExpression assignment) {}
-  V8_INLINE void QueueNonPatternForRewriting(const PreParserExpression& expr,
-                                             bool* ok) {}
 
   // Helper functions for recursive descent.
   V8_INLINE bool IsEval(const PreParserIdentifier& identifier) const {
@@ -1289,6 +1302,13 @@ class PreParser : public ParserBase<PreParser> {
       PreParserExpression* x, const PreParserExpression& y, Token::Value op,
       int pos) {
     return false;
+  }
+
+  V8_INLINE NaryOperation* CollapseNaryExpression(PreParserExpression* x,
+                                                  PreParserExpression y,
+                                                  Token::Value op, int pos,
+                                                  const SourceRange& range) {
+    return nullptr;
   }
 
   V8_INLINE PreParserExpression BuildUnaryExpression(
@@ -1407,13 +1427,13 @@ class PreParser : public ParserBase<PreParser> {
   }
 
   // Reporting errors.
-  V8_INLINE void ReportMessageAt(Scanner::Location source_location,
-                                 MessageTemplate::Template message,
-                                 const char* arg = nullptr,
-                                 ParseErrorType error_type = kSyntaxError) {
-    pending_error_handler_->ReportMessageAt(source_location.beg_pos,
-                                            source_location.end_pos, message,
-                                            arg, error_type);
+  void ReportMessageAt(Scanner::Location source_location,
+                       MessageTemplate::Template message,
+                       const char* arg = nullptr,
+                       ParseErrorType error_type = kSyntaxError) {
+    pending_error_handler()->ReportMessageAt(source_location.beg_pos,
+                                             source_location.end_pos, message,
+                                             arg, error_type);
   }
 
   V8_INLINE void ReportMessageAt(Scanner::Location source_location,
@@ -1648,10 +1668,6 @@ class PreParser : public ParserBase<PreParser> {
     return function_state_->GetReportedErrorList();
   }
 
-  V8_INLINE ZoneList<PreParserExpression>* GetNonPatternList() const {
-    return function_state_->non_patterns_to_rewrite();
-  }
-
   V8_INLINE void CountUsage(v8::Isolate::UseCounterFeature feature) {
     if (use_counts_ != nullptr) ++use_counts_[feature];
   }
@@ -1671,7 +1687,6 @@ class PreParser : public ParserBase<PreParser> {
   int* use_counts_;
   bool track_unresolved_variables_;
   PreParserLogger log_;
-  PendingCompilationErrorHandler* pending_error_handler_;
 
   ProducedPreParsedScopeData* produced_preparsed_scope_data_;
 };

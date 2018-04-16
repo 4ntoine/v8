@@ -47,14 +47,13 @@ namespace internal {
 
 ConvertDToIFunc MakeConvertDToIFuncTrampoline(Isolate* isolate,
                                               Register destination_reg) {
-  // Allocate an executable page of memory.
-  size_t actual_size;
-  byte* buffer = static_cast<byte*>(v8::base::OS::Allocate(
-      Assembler::kMinimalBufferSize, &actual_size, true));
-  CHECK(buffer);
   HandleScope handles(isolate);
-  MacroAssembler masm(isolate, buffer, static_cast<int>(actual_size),
+
+  size_t allocated;
+  byte* buffer = AllocateAssemblerBuffer(&allocated);
+  MacroAssembler masm(isolate, buffer, static_cast<int>(allocated),
                       v8::internal::CodeObjectRequired::kYes);
+
   DoubleToIStub stub(isolate, destination_reg);
 
   byte* start = stub.GetCode()->instruction_start();
@@ -103,7 +102,7 @@ ConvertDToIFunc MakeConvertDToIFuncTrampoline(Isolate* isolate,
       Register reg = Register::from_code(reg_num);
       if (reg != destination_reg) {
         __ lw(at, MemOperand(sp, 0));
-        __ Assert(eq, kRegisterWasClobbered, reg, Operand(at));
+        __ Assert(eq, AbortReason::kRegisterWasClobbered, reg, Operand(at));
         __ Addu(sp, sp, Operand(kPointerSize));
       }
     }
@@ -129,7 +128,8 @@ ConvertDToIFunc MakeConvertDToIFuncTrampoline(Isolate* isolate,
 
   CodeDesc desc;
   masm.GetCode(isolate, &desc);
-  Assembler::FlushICache(isolate, buffer, actual_size);
+  MakeAssemblerBufferExecutable(buffer, allocated);
+  Assembler::FlushICache(isolate, buffer, allocated);
   return (reinterpret_cast<ConvertDToIFunc>(
       reinterpret_cast<intptr_t>(buffer)));
 }

@@ -21,16 +21,23 @@
 #include "src/isolate-inl.h"
 #include "src/objects/debug-objects-inl.h"
 #include "src/runtime/runtime.h"
+#include "src/snapshot/snapshot.h"
 #include "src/wasm/wasm-objects-inl.h"
 
 namespace v8 {
 namespace internal {
 
-RUNTIME_FUNCTION(Runtime_DebugBreakOnBytecode) {
+RUNTIME_FUNCTION_RETURN_PAIR(Runtime_DebugBreakOnBytecode) {
+  using interpreter::Bytecode;
+  using interpreter::Bytecodes;
+  using interpreter::OperandScale;
+
   SealHandleScope shs(isolate);
   DCHECK_EQ(1, args.length());
   CONVERT_ARG_HANDLE_CHECKED(Object, value, 0);
   HandleScope scope(isolate);
+  // Return value can be changed by debugger. Last set value will be used as
+  // return value.
   ReturnValueScope result_scope(isolate->debug());
   isolate->debug()->set_return_value(*value);
 
@@ -45,16 +52,22 @@ RUNTIME_FUNCTION(Runtime_DebugBreakOnBytecode) {
   SharedFunctionInfo* shared = interpreted_frame->function()->shared();
   BytecodeArray* bytecode_array = shared->bytecode_array();
   int bytecode_offset = interpreted_frame->GetBytecodeOffset();
-  interpreter::Bytecode bytecode =
-      interpreter::Bytecodes::FromByte(bytecode_array->get(bytecode_offset));
-  if (bytecode == interpreter::Bytecode::kReturn) {
+  Bytecode bytecode = Bytecodes::FromByte(bytecode_array->get(bytecode_offset));
+  if (bytecode == Bytecode::kReturn) {
     // If we are returning, reset the bytecode array on the interpreted stack
     // frame to the non-debug variant so that the interpreter entry trampoline
     // sees the return bytecode rather than the DebugBreak.
     interpreted_frame->PatchBytecodeArray(bytecode_array);
   }
-  return isolate->interpreter()->GetBytecodeHandler(
-      bytecode, interpreter::OperandScale::kSingle);
+
+  // We do not have to deal with operand scale here. If the bytecode at the
+  // break is prefixed by operand scaling, we would have patched over the
+  // scaling prefix. We now simply dispatch to the handler for the prefix.
+  OperandScale operand_scale = OperandScale::kSingle;
+  Code* code = isolate->interpreter()->GetAndMaybeDeserializeBytecodeHandler(
+      bytecode, operand_scale);
+
+  return MakePair(isolate->debug()->return_value(), code);
 }
 
 
@@ -434,7 +447,6 @@ RUNTIME_FUNCTION(Runtime_GetFrameCount) {
   }
 
   std::vector<FrameSummary> frames;
-  frames.reserve(FLAG_max_inlining_levels + 1);
   for (StackTraceFrameIterator it(isolate, id); !it.done(); it.Advance()) {
     frames.clear();
     it.frame()->Summarize(&frames);
@@ -1468,7 +1480,7 @@ RUNTIME_FUNCTION(Runtime_GetDebugContext) {
 RUNTIME_FUNCTION(Runtime_CollectGarbage) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(1, args.length());
-  isolate->heap()->CollectAllGarbage(Heap::kNoGCFlags,
+  isolate->heap()->CollectAllGarbage(Heap::kAbortIncrementalMarkingMask,
                                      GarbageCollectionReason::kRuntime);
   return isolate->heap()->undefined_value();
 }
@@ -1542,6 +1554,7 @@ int ScriptLinePosition(Handle<Script> script, int line) {
 
   if (script->type() == Script::TYPE_WASM) {
     return WasmCompiledModule::cast(script->wasm_compiled_module())
+        ->shared()
         ->GetFunctionOffset(line);
   }
 
@@ -1860,7 +1873,6 @@ RUNTIME_FUNCTION(Runtime_DebugAsyncFunctionPromiseCreated) {
                         handle(Smi::FromInt(id), isolate),
                         LanguageMode::kStrict)
       .Assert();
-  isolate->debug()->OnAsyncTaskEvent(debug::kDebugEnqueueAsyncFunction, id, 0);
   return isolate->heap()->undefined_value();
 }
 
@@ -1871,20 +1883,6 @@ RUNTIME_FUNCTION(Runtime_DebugPromiseReject) {
   CONVERT_ARG_HANDLE_CHECKED(Object, value, 1);
 
   isolate->debug()->OnPromiseReject(rejected_promise, value);
-  return isolate->heap()->undefined_value();
-}
-
-RUNTIME_FUNCTION(Runtime_DebugAsyncEventEnqueueRecurring) {
-  HandleScope scope(isolate);
-  DCHECK_EQ(2, args.length());
-  CONVERT_ARG_HANDLE_CHECKED(JSPromise, promise, 0);
-  CONVERT_SMI_ARG_CHECKED(status, 1);
-  if (isolate->debug()->is_active()) {
-    isolate->debug()->OnAsyncTaskEvent(
-        status == v8::Promise::kFulfilled ? debug::kDebugEnqueuePromiseResolve
-                                          : debug::kDebugEnqueuePromiseReject,
-        isolate->debug()->NextAsyncTaskId(promise), 0);
-  }
   return isolate->heap()->undefined_value();
 }
 

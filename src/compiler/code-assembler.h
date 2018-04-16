@@ -17,6 +17,7 @@
 #include "src/globals.h"
 #include "src/heap/heap.h"
 #include "src/machine-type.h"
+#include "src/objects/data-handler.h"
 #include "src/runtime/runtime.h"
 #include "src/zone/zone-containers.h"
 
@@ -26,6 +27,10 @@ namespace internal {
 class Callable;
 class CallInterfaceDescriptor;
 class Isolate;
+class JSCollection;
+class JSWeakCollection;
+class JSWeakMap;
+class JSWeakSet;
 class Factory;
 class Zone;
 
@@ -191,6 +196,7 @@ enum class ObjectType {
 #undef ENUM_STRUCT_ELEMENT
 
 class AccessCheckNeeded;
+class ClassBoilerplate;
 class CompilationCacheTable;
 class Constructor;
 class Filler;
@@ -251,7 +257,7 @@ class Node;
 class RawMachineAssembler;
 class RawMachineLabel;
 
-typedef ZoneList<CodeAssemblerVariable*> CodeAssemblerVariableList;
+typedef ZoneVector<CodeAssemblerVariable*> CodeAssemblerVariableList;
 
 typedef std::function<void()> CodeAssemblerCallback;
 
@@ -629,6 +635,12 @@ class V8_EXPORT_PRIVATE CodeAssembler {
   TNode<Number> NumberConstant(double value);
   TNode<Smi> SmiConstant(Smi* value);
   TNode<Smi> SmiConstant(int value);
+  template <typename E,
+            typename = typename std::enable_if<std::is_enum<E>::value>::type>
+  TNode<Smi> SmiConstant(E value) {
+    STATIC_ASSERT(sizeof(E) <= sizeof(int));
+    return SmiConstant(static_cast<int>(value));
+  }
   TNode<HeapObject> UntypedHeapConstant(Handle<HeapObject> object);
   template <class Type>
   TNode<Type> HeapConstant(Handle<Type> object) {
@@ -897,6 +909,10 @@ class V8_EXPORT_PRIVATE CodeAssembler {
         function, context, base::implicit_cast<SloppyTNode<Object>>(args)...);
   }
 
+  //
+  // If context passed to CallStub is nullptr, it won't be passed to the stub.
+  //
+
   template <class... TArgs>
   Node* CallStub(Callable const& callable, Node* context, TArgs... args) {
     Node* target = HeapConstant(callable.code());
@@ -916,7 +932,8 @@ class V8_EXPORT_PRIVATE CodeAssembler {
                   Node* target, Node* context, TArgs... args);
 
   Node* CallStubN(const CallInterfaceDescriptor& descriptor, size_t result_size,
-                  int input_count, Node* const* inputs);
+                  int input_count, Node* const* inputs,
+                  bool pass_context = true);
 
   template <class... TArgs>
   Node* TailCallStub(Callable const& callable, Node* context, TArgs... args) {
@@ -994,6 +1011,19 @@ class V8_EXPORT_PRIVATE CodeAssembler {
       MachineType arg2_type, Node* function, Node* arg0, Node* arg1, Node* arg2,
       SaveFPRegsMode mode);
 
+  // Call to a C function with four arguments.
+  Node* CallCFunction4(MachineType return_type, MachineType arg0_type,
+                       MachineType arg1_type, MachineType arg2_type,
+                       MachineType arg3_type, Node* function, Node* arg0,
+                       Node* arg1, Node* arg2, Node* arg3);
+
+  // Call to a C function with five arguments.
+  Node* CallCFunction5(MachineType return_type, MachineType arg0_type,
+                       MachineType arg1_type, MachineType arg2_type,
+                       MachineType arg3_type, MachineType arg4_type,
+                       Node* function, Node* arg0, Node* arg1, Node* arg2,
+                       Node* arg3, Node* arg4);
+
   // Call to a C function with six arguments.
   Node* CallCFunction6(MachineType return_type, MachineType arg0_type,
                        MachineType arg1_type, MachineType arg2_type,
@@ -1034,7 +1064,14 @@ class V8_EXPORT_PRIVATE CodeAssembler {
       const CodeAssemblerCallback& call_epilogue);
   void UnregisterCallGenerationCallbacks();
 
+  bool Word32ShiftIsSafe() const;
+
  private:
+  // These two don't have definitions and are here only for catching use cases
+  // where the cast is not necessary.
+  TNode<Int32T> Signed(TNode<Int32T> x);
+  TNode<Uint32T> Unsigned(TNode<Uint32T> x);
+
   RawMachineAssembler* raw_assembler() const;
 
   // Calls respective callback registered in the state.
@@ -1130,7 +1167,7 @@ class CodeAssemblerLabel {
       CodeAssembler* assembler,
       const CodeAssemblerVariableList& merged_variables,
       CodeAssemblerLabel::Type type = CodeAssemblerLabel::kNonDeferred)
-      : CodeAssemblerLabel(assembler, merged_variables.length(),
+      : CodeAssemblerLabel(assembler, merged_variables.size(),
                            &(merged_variables[0]), type) {}
   CodeAssemblerLabel(
       CodeAssembler* assembler, size_t count,
@@ -1178,11 +1215,14 @@ class V8_EXPORT_PRIVATE CodeAssemblerState {
   // TODO(rmcilroy): move result_size to the CallInterfaceDescriptor.
   CodeAssemblerState(Isolate* isolate, Zone* zone,
                      const CallInterfaceDescriptor& descriptor, Code::Kind kind,
-                     const char* name, size_t result_size = 1);
+                     const char* name, size_t result_size = 1,
+                     uint32_t stub_key = 0,
+                     int32_t builtin_index = Builtins::kNoBuiltinId);
 
   // Create with JSCall linkage.
   CodeAssemblerState(Isolate* isolate, Zone* zone, int parameter_count,
-                     Code::Kind kind, const char* name);
+                     Code::Kind kind, const char* name,
+                     int32_t builtin_index = Builtins::kNoBuiltinId);
 
   ~CodeAssemblerState();
 
@@ -1191,6 +1231,7 @@ class V8_EXPORT_PRIVATE CodeAssemblerState {
 
 #if DEBUG
   void PrintCurrentBlock(std::ostream& os);
+  bool InsideBlock();
 #endif  // DEBUG
   void SetInitialDebugInformation(const char* msg, const char* file, int line);
 
@@ -1202,11 +1243,14 @@ class V8_EXPORT_PRIVATE CodeAssemblerState {
 
   CodeAssemblerState(Isolate* isolate, Zone* zone,
                      CallDescriptor* call_descriptor, Code::Kind kind,
-                     const char* name);
+                     const char* name, uint32_t stub_key,
+                     int32_t builtin_index);
 
   std::unique_ptr<RawMachineAssembler> raw_assembler_;
   Code::Kind kind_;
   const char* name_;
+  uint32_t stub_key_;
+  int32_t builtin_index_;
   bool code_generated_;
   ZoneSet<CodeAssemblerVariable::Impl*> variables_;
   CodeAssemblerCallback call_prologue_;

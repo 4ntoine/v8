@@ -84,11 +84,12 @@ Node* ConstructorBuiltinsAssembler::EmitFastNewClosure(Node* shared_info,
 
   // Create a new closure from the given function info in new space
   Node* instance_size_in_bytes =
-      TimesPointerSize(LoadMapInstanceSize(function_map));
+      TimesPointerSize(LoadMapInstanceSizeInWords(function_map));
   Node* result = Allocate(instance_size_in_bytes);
   StoreMapNoWriteBarrier(result, function_map);
-  InitializeJSObjectBody(result, function_map, instance_size_in_bytes,
-                         JSFunction::kSizeWithoutPrototype);
+  InitializeJSObjectBodyNoSlackTracking(result, function_map,
+                                        instance_size_in_bytes,
+                                        JSFunction::kSizeWithoutPrototype);
 
   // Initialize the rest of the function.
   Node* empty_fixed_array = HeapConstant(factory->empty_fixed_array());
@@ -133,6 +134,7 @@ Node* ConstructorBuiltinsAssembler::EmitFastNewClosure(Node* shared_info,
 
     BIND(&cell_done);
   }
+  STATIC_ASSERT(JSFunction::kSizeWithoutPrototype == 7 * kPointerSize);
   StoreObjectFieldNoWriteBarrier(result, JSFunction::kFeedbackVectorOffset,
                                  literals_cell);
   StoreObjectFieldNoWriteBarrier(result, JSFunction::kSharedFunctionInfoOffset,
@@ -236,12 +238,8 @@ Node* ConstructorBuiltinsAssembler::EmitFastNewObject(Node* context,
   }
 
   BIND(&instantiate_map);
-
-  Node* object = AllocateJSObjectFromMap(initial_map, properties.value());
-
-  // Perform in-object slack tracking if requested.
-  HandleSlackTracking(context, object, initial_map, JSObject::kHeaderSize);
-  return object;
+  return AllocateJSObjectFromMap(initial_map, properties.value(), nullptr,
+                                 kNone, kWithSlackTracking);
 }
 
 Node* ConstructorBuiltinsAssembler::EmitFastNewFunctionContext(
@@ -460,10 +458,10 @@ Node* ConstructorBuiltinsAssembler::EmitCreateShallowObjectLiteral(
   VARIABLE(var_properties, MachineRepresentation::kTagged);
   {
     Node* bit_field_3 = LoadMapBitField3(boilerplate_map);
-    GotoIf(IsSetWord32<Map::Deprecated>(bit_field_3), call_runtime);
+    GotoIf(IsSetWord32<Map::IsDeprecatedBit>(bit_field_3), call_runtime);
     // Directly copy over the property store for dict-mode boilerplates.
     Label if_dictionary(this), if_fast(this), done(this);
-    Branch(IsSetWord32<Map::DictionaryMap>(bit_field_3), &if_dictionary,
+    Branch(IsSetWord32<Map::IsDictionaryMapBit>(bit_field_3), &if_dictionary,
            &if_fast);
     BIND(&if_dictionary);
     {
@@ -511,7 +509,8 @@ Node* ConstructorBuiltinsAssembler::EmitCreateShallowObjectLiteral(
   // Ensure new-space allocation for a fresh JSObject so we can skip write
   // barriers when copying all object fields.
   STATIC_ASSERT(JSObject::kMaxInstanceSize < kMaxRegularHeapObjectSize);
-  Node* instance_size = TimesPointerSize(LoadMapInstanceSize(boilerplate_map));
+  Node* instance_size =
+      TimesPointerSize(LoadMapInstanceSizeInWords(boilerplate_map));
   Node* allocation_size = instance_size;
   bool needs_allocation_memento = FLAG_allocation_site_pretenuring;
   if (needs_allocation_memento) {
@@ -638,8 +637,8 @@ Node* ConstructorBuiltinsAssembler::EmitCreateEmptyObjectLiteral(
   CSA_ASSERT(this, IsMap(map));
   // Ensure that slack tracking is disabled for the map.
   STATIC_ASSERT(Map::kNoSlackTracking == 0);
-  CSA_ASSERT(this,
-             IsClearWord32<Map::ConstructionCounter>(LoadMapBitField3(map)));
+  CSA_ASSERT(
+      this, IsClearWord32<Map::ConstructionCounterBits>(LoadMapBitField3(map)));
   Node* empty_fixed_array = EmptyFixedArrayConstant();
   Node* result =
       AllocateJSObjectFromMap(map, empty_fixed_array, empty_fixed_array);
@@ -701,7 +700,8 @@ TF_BUILTIN(NumberConstructor, ConstructorBuiltinsAssembler) {
   GotoIf(IntPtrEqual(IntPtrConstant(0), argc), &return_zero);
 
   Node* context = Parameter(BuiltinDescriptor::kContext);
-  args.PopAndReturn(ToNumber(context, args.AtIndex(0)));
+  args.PopAndReturn(
+      ToNumber(context, args.AtIndex(0), BigIntHandling::kConvertToNumber));
 
   BIND(&return_zero);
   args.PopAndReturn(SmiConstant(0));
@@ -717,28 +717,19 @@ TF_BUILTIN(NumberConstructor_ConstructStub, ConstructorBuiltinsAssembler) {
       ChangeInt32ToIntPtr(Parameter(BuiltinDescriptor::kArgumentsCount));
   CodeStubArguments args(this, argc);
 
-  Label return_zero(this), wrap(this);
+  Label wrap(this);
 
-  VARIABLE(var_result, MachineRepresentation::kTagged);
+  VARIABLE(var_result, MachineRepresentation::kTagged, SmiConstant(0));
 
-  GotoIf(IntPtrEqual(IntPtrConstant(0), argc), &return_zero);
-  {
-    var_result.Bind(ToNumber(context, args.AtIndex(0)));
-    Goto(&wrap);
-  }
-
-  BIND(&return_zero);
-  {
-    var_result.Bind(SmiConstant(0));
-    Goto(&wrap);
-  }
+  GotoIf(IntPtrEqual(IntPtrConstant(0), argc), &wrap);
+  var_result.Bind(
+      ToNumber(context, args.AtIndex(0), BigIntHandling::kConvertToNumber));
+  Goto(&wrap);
 
   BIND(&wrap);
-  {
-    Node* result = EmitFastNewObject(context, target, new_target);
-    StoreObjectField(result, JSValue::kValueOffset, var_result.value());
-    args.PopAndReturn(result);
-  }
+  Node* result = EmitFastNewObject(context, target, new_target);
+  StoreObjectField(result, JSValue::kValueOffset, var_result.value());
+  args.PopAndReturn(result);
 }
 
 Node* ConstructorBuiltinsAssembler::EmitConstructString(Node* argc,

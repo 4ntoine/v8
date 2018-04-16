@@ -3,6 +3,10 @@
 // found in the LICENSE file.
 
 #include "src/heap/array-buffer-tracker.h"
+
+#include <vector>
+
+#include "src/heap/array-buffer-collector.h"
 #include "src/heap/array-buffer-tracker-inl.h"
 #include "src/heap/heap.h"
 #include "src/heap/spaces.h"
@@ -16,6 +20,9 @@ LocalArrayBufferTracker::~LocalArrayBufferTracker() {
 
 template <typename Callback>
 void LocalArrayBufferTracker::Process(Callback callback) {
+  std::vector<JSArrayBuffer::Allocation>* backing_stores_to_free =
+      new std::vector<JSArrayBuffer::Allocation>();
+
   JSArrayBuffer* new_buffer = nullptr;
   JSArrayBuffer* old_buffer = nullptr;
   size_t new_retained_size = 0;
@@ -31,7 +38,7 @@ void LocalArrayBufferTracker::Process(Callback callback) {
       DCHECK_NOT_NULL(new_buffer);
       Page* target_page = Page::FromAddress(new_buffer->address());
       {
-        base::LockGuard<base::RecursiveMutex> guard(target_page->mutex());
+        base::LockGuard<base::Mutex> guard(target_page->mutex());
         LocalArrayBufferTracker* tracker = target_page->local_tracker();
         if (tracker == nullptr) {
           target_page->AllocateLocalTracker();
@@ -45,7 +52,12 @@ void LocalArrayBufferTracker::Process(Callback callback) {
       it = array_buffers_.erase(it);
     } else if (result == kRemoveEntry) {
       // Size of freed memory is computed to avoid looking at dead objects.
-      old_buffer->FreeBackingStore();
+      void* allocation_base = old_buffer->allocation_base();
+      DCHECK_NOT_NULL(allocation_base);
+
+      backing_stores_to_free->emplace_back(allocation_base,
+                                           old_buffer->allocation_length(),
+                                           old_buffer->allocation_mode());
       it = array_buffers_.erase(it);
     } else {
       UNREACHABLE();
@@ -57,16 +69,21 @@ void LocalArrayBufferTracker::Process(Callback callback) {
         static_cast<intptr_t>(freed_memory));
   }
   retained_size_ = new_retained_size;
+
+  // Pass the backing stores that need to be freed to the main thread for later
+  // distribution.
+  // ArrayBufferCollector takes ownership of this pointer.
+  heap_->array_buffer_collector()->AddGarbageAllocations(
+      backing_stores_to_free);
 }
 
-void ArrayBufferTracker::FreeDeadInNewSpace(Heap* heap) {
+void ArrayBufferTracker::PrepareToFreeDeadInNewSpace(Heap* heap) {
   DCHECK_EQ(heap->gc_state(), Heap::HeapState::SCAVENGE);
   for (Page* page : PageRange(heap->new_space()->FromSpaceStart(),
                               heap->new_space()->FromSpaceEnd())) {
     bool empty = ProcessBuffers(page, kUpdateForwardedRemoveOthers);
     CHECK(empty);
   }
-  heap->account_external_memory_concurrently_freed();
 }
 
 size_t ArrayBufferTracker::RetainedInNewSpace(Heap* heap) {
@@ -111,7 +128,7 @@ bool ArrayBufferTracker::ProcessBuffers(Page* page, ProcessingMode mode) {
 bool ArrayBufferTracker::IsTracked(JSArrayBuffer* buffer) {
   Page* page = Page::FromAddress(buffer->address());
   {
-    base::LockGuard<base::RecursiveMutex> guard(page->mutex());
+    base::LockGuard<base::Mutex> guard(page->mutex());
     LocalArrayBufferTracker* tracker = page->local_tracker();
     if (tracker == nullptr) return false;
     return tracker->IsTracked(buffer);

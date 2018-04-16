@@ -5,9 +5,6 @@
 #ifndef V8_UTILS_H_
 #define V8_UTILS_H_
 
-#if defined(V8_OS_AIX)
-#include <fenv.h>  // NOLINT(build/c++11)
-#endif
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +21,10 @@
 #include "src/globals.h"
 #include "src/vector.h"
 #include "src/zone/zone.h"
+
+#if defined(V8_OS_AIX)
+#include <fenv.h>  // NOLINT(build/c++11)
+#endif
 
 namespace v8 {
 namespace internal {
@@ -287,7 +288,7 @@ T SaturateAdd(T a, T b) {
 template <typename T>
 T SaturateSub(T a, T b) {
   if (std::is_signed<T>::value) {
-    if (a > 0 && b < 0) {
+    if (a >= 0 && b < 0) {
       if (a > std::numeric_limits<T>::max() + b) {
         return std::numeric_limits<T>::max();
       }
@@ -383,9 +384,9 @@ class BitField64 : public BitFieldBase<T, shift, size, uint64_t> { };
 #define DEFINE_BIT_FIELD_RANGE_TYPE(Name, Type, Size, _) \
   k##Name##Start, k##Name##End = k##Name##Start + Size - 1,
 
-#define DEFINE_BIT_RANGES(LIST_MACRO)                    \
-  struct LIST_MACRO##_Ranges {                           \
-    enum { LIST_MACRO(DEFINE_BIT_FIELD_RANGE_TYPE, _) }; \
+#define DEFINE_BIT_RANGES(LIST_MACRO)                               \
+  struct LIST_MACRO##_Ranges {                                      \
+    enum { LIST_MACRO(DEFINE_BIT_FIELD_RANGE_TYPE, _) kBitsCount }; \
   };
 
 #define DEFINE_BIT_FIELD_TYPE(Name, Type, Size, RangesName) \
@@ -454,7 +455,7 @@ class BitSetComputer {
 //
 // DEFINE_FIELD_OFFSET_CONSTANTS(HeapObject::kHeaderSize, MAP_FIELDS)
 //
-#define DEFINE_ONE_FIELD_OFFSET(Name, Size) Name, Name##End = Name + Size - 1,
+#define DEFINE_ONE_FIELD_OFFSET(Name, Size) Name, Name##End = Name + (Size)-1,
 
 #define DEFINE_FIELD_OFFSET_CONSTANTS(StartOffset, LIST_MACRO) \
   enum {                                                       \
@@ -640,7 +641,7 @@ class Access {
 template<typename T>
 class SetOncePointer {
  public:
-  SetOncePointer() : pointer_(nullptr) {}
+  SetOncePointer() = default;
 
   bool is_set() const { return pointer_ != nullptr; }
 
@@ -654,8 +655,16 @@ class SetOncePointer {
     pointer_ = value;
   }
 
+  T* operator=(T* value) {
+    set(value);
+    return value;
+  }
+
+  bool operator==(std::nullptr_t) const { return pointer_ == nullptr; }
+  bool operator!=(std::nullptr_t) const { return pointer_ != nullptr; }
+
  private:
-  T* pointer_;
+  T* pointer_ = nullptr;
 };
 
 

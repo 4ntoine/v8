@@ -200,9 +200,11 @@ HEAP_TEST(TestNewSpaceRefsInCopiedCode) {
   Handle<Code> code =
       isolate->factory()->NewCode(desc, Code::STUB, Handle<Code>());
 
-  Code* tmp = nullptr;
-  heap->CopyCode(*code).To(&tmp);
-  Handle<Code> copy(tmp);
+  Handle<Code> copy;
+  {
+    CodeSpaceMemoryModificationScope modification_scope(isolate->heap());
+    copy = factory->CopyCode(code);
+  }
 
   CheckEmbeddedObjectsAreEqual(code, copy);
   CcTest::CollectAllAvailableGarbage();
@@ -363,7 +365,7 @@ TEST(GarbageCollection) {
   {
     HandleScope inner_scope(isolate);
     // Allocate a function and keep it in global object's property.
-    Handle<JSFunction> function = factory->NewFunction(name);
+    Handle<JSFunction> function = factory->NewFunctionForTest(name);
     JSReceiver::SetProperty(global, name, function, LanguageMode::kSloppy)
         .Check();
     // Allocate an object.  Unrooted after leaving the scope.
@@ -749,14 +751,13 @@ TEST(DeleteWeakGlobalHandle) {
 
 TEST(BytecodeArray) {
   if (FLAG_never_compact) return;
-  static const uint8_t kRawBytes[] = {0xc3, 0x7e, 0xa5, 0x5a};
+  static const uint8_t kRawBytes[] = {0xC3, 0x7E, 0xA5, 0x5A};
   static const int kRawBytesSize = sizeof(kRawBytes);
   static const int kFrameSize = 32;
   static const int kParameterCount = 2;
 
-  FLAG_concurrent_marking = false;
+  ManualGCScope manual_gc_scope;
   FLAG_manual_evacuation_candidates_selection = true;
-  FLAG_stress_incremental_marking = false;
   CcTest::InitializeVM();
   Isolate* isolate = CcTest::i_isolate();
   Heap* heap = isolate->heap();
@@ -809,7 +810,7 @@ TEST(BytecodeArray) {
 }
 
 TEST(BytecodeArrayAging) {
-  static const uint8_t kRawBytes[] = {0xc3, 0x7e, 0xa5, 0x5a};
+  static const uint8_t kRawBytes[] = {0xC3, 0x7E, 0xA5, 0x5A};
   static const int kRawBytesSize = sizeof(kRawBytes);
   static const int kFrameSize = 32;
   static const int kParameterCount = 2;
@@ -929,7 +930,7 @@ TEST(FunctionAllocation) {
 
   v8::HandleScope sc(CcTest::isolate());
   Handle<String> name = factory->InternalizeUtf8String("theFunction");
-  Handle<JSFunction> function = factory->NewFunction(name);
+  Handle<JSFunction> function = factory->NewFunctionForTest(name);
 
   Handle<Smi> twenty_three(Smi::FromInt(23), isolate);
   Handle<Smi> twenty_four(Smi::FromInt(24), isolate);
@@ -1031,7 +1032,7 @@ TEST(JSObjectMaps) {
 
   v8::HandleScope sc(CcTest::isolate());
   Handle<String> name = factory->InternalizeUtf8String("theFunction");
-  Handle<JSFunction> function = factory->NewFunction(name);
+  Handle<JSFunction> function = factory->NewFunctionForTest(name);
 
   Handle<String> prop_name = factory->InternalizeUtf8String("theSlot");
   Handle<JSObject> obj = factory->NewJSObject(function);
@@ -1175,7 +1176,7 @@ TEST(StringAllocation) {
   Isolate* isolate = CcTest::i_isolate();
   Factory* factory = isolate->factory();
 
-  const unsigned char chars[] = { 0xe5, 0xa4, 0xa7 };
+  const unsigned char chars[] = {0xE5, 0xA4, 0xA7};
   for (int length = 0; length < 100; length++) {
     v8::HandleScope scope(CcTest::isolate());
     char* non_one_byte = NewArray<char>(3 * length + 1);
@@ -1703,7 +1704,7 @@ static Address AlignOldSpace(AllocationAlignment alignment, int offset) {
   }
   Address top = *top_addr;
   // Now force the remaining allocation onto the free list.
-  CcTest::heap()->old_space()->EmptyAllocationInfo();
+  CcTest::heap()->old_space()->FreeLinearAllocationArea();
   return top;
 }
 
@@ -2880,16 +2881,16 @@ TEST(ReleaseOverReservedPages) {
   // The optimizer can allocate stuff, messing up the test.
   FLAG_opt = false;
   FLAG_always_opt = false;
-  // Parallel compaction increases fragmentation, depending on how existing
-  // memory is distributed. Since this is non-deterministic because of
-  // concurrent sweeping, we disable it for this test.
-  FLAG_parallel_compaction = false;
-  FLAG_concurrent_marking = false;
-  // Concurrent sweeping adds non determinism, depending on when memory is
-  // available for further reuse.
-  FLAG_concurrent_sweeping = false;
-  // Fast evacuation of pages may result in a different page count in old space.
+  // - Parallel compaction increases fragmentation, depending on how existing
+  //   memory is distributed. Since this is non-deterministic because of
+  //   concurrent sweeping, we disable it for this test.
+  // - Concurrent sweeping adds non determinism, depending on when memory is
+  //   available for further reuse.
+  // - Fast evacuation of pages may result in a different page count in old
+  //   space.
+  ManualGCScope manual_gc_scope;
   FLAG_page_promotion = false;
+  FLAG_parallel_compaction = false;
   CcTest::InitializeVM();
   Isolate* isolate = CcTest::i_isolate();
   // If there's snapshot available, we don't know whether 20 small arrays will
@@ -3911,6 +3912,30 @@ TEST(NextCodeLinkIsWeak) {
   CHECK_EQ(code_chain_length_before - 1, code_chain_length_after);
 }
 
+TEST(NextCodeLinkInCodeDataContainerIsCleared) {
+  FLAG_always_opt = false;
+  FLAG_allow_natives_syntax = true;
+  CcTest::InitializeVM();
+  Isolate* isolate = CcTest::i_isolate();
+  v8::internal::Heap* heap = CcTest::heap();
+
+  if (!isolate->use_optimizer()) return;
+  HandleScope outer_scope(heap->isolate());
+  Handle<CodeDataContainer> code_data_container;
+  {
+    HandleScope scope(heap->isolate());
+    Handle<JSFunction> mortal1 =
+        OptimizeDummyFunction(CcTest::isolate(), "mortal1");
+    Handle<JSFunction> mortal2 =
+        OptimizeDummyFunction(CcTest::isolate(), "mortal2");
+    CHECK_EQ(mortal2->code()->next_code_link(), mortal1->code());
+    code_data_container = scope.CloseAndEscape(
+        Handle<CodeDataContainer>(mortal2->code()->code_data_container()));
+    CompileRun("mortal1 = null; mortal2 = null;");
+  }
+  CcTest::CollectAllAvailableGarbage();
+  CHECK(code_data_container->next_code_link()->IsUndefined(isolate));
+}
 
 static Handle<Code> DummyOptimizedCode(Isolate* isolate) {
   i::byte buffer[i::Assembler::kMinimalBufferSize];
@@ -3918,7 +3943,8 @@ static Handle<Code> DummyOptimizedCode(Isolate* isolate) {
                       v8::internal::CodeObjectRequired::kYes);
   CodeDesc desc;
   masm.Push(isolate->factory()->undefined_value());
-  masm.Drop(1);
+  masm.Push(isolate->factory()->undefined_value());
+  masm.Drop(2);
   masm.GetCode(isolate, &desc);
   Handle<Object> undefined(isolate->heap()->undefined_value(), isolate);
   Handle<Code> code =
@@ -4435,7 +4461,7 @@ static void RequestInterrupt(const v8::FunctionCallbackInfo<v8::Value>& args) {
 }
 
 HEAP_TEST(Regress538257) {
-  FLAG_concurrent_marking = false;
+  ManualGCScope manual_gc_scope;
   FLAG_manual_evacuation_candidates_selection = true;
   v8::Isolate::CreateParams create_params;
   // Set heap limits.
@@ -5086,8 +5112,7 @@ TEST(SharedFunctionInfoIterator) {
 }
 
 HEAP_TEST(Regress587004) {
-  FLAG_concurrent_marking = false;
-  FLAG_concurrent_sweeping = false;
+  ManualGCScope manual_gc_scope;
 #ifdef VERIFY_HEAP
   FLAG_verify_heap = false;
 #endif
@@ -5129,8 +5154,7 @@ HEAP_TEST(Regress589413) {
   FLAG_stress_compaction = true;
   FLAG_manual_evacuation_candidates_selection = true;
   FLAG_parallel_compaction = false;
-  FLAG_concurrent_marking = false;
-  FLAG_concurrent_sweeping = false;
+  ManualGCScope manual_gc_scope;
   CcTest::InitializeVM();
   v8::HandleScope scope(CcTest::isolate());
   Heap* heap = CcTest::heap();
@@ -5152,7 +5176,7 @@ HEAP_TEST(Regress589413) {
   // Make sure the byte arrays will be promoted on the next GC.
   CcTest::CollectGarbage(NEW_SPACE);
   // This number is close to large free list category threshold.
-  const int N = 0x3eee;
+  const int N = 0x3EEE;
   {
     std::vector<FixedArray*> arrays;
     std::set<Page*> pages;
@@ -5406,8 +5430,7 @@ TEST(Regress631969) {
   if (!FLAG_incremental_marking) return;
   FLAG_manual_evacuation_candidates_selection = true;
   FLAG_parallel_compaction = false;
-  FLAG_concurrent_marking = false;
-  FLAG_concurrent_sweeping = false;
+  ManualGCScope manual_gc_scope;
   CcTest::InitializeVM();
   v8::HandleScope scope(CcTest::isolate());
   Heap* heap = CcTest::heap();
@@ -5654,9 +5677,8 @@ TEST(UncommitUnusedLargeObjectMemory) {
 
   CcTest::CollectAllGarbage();
   CHECK(chunk->CommittedPhysicalMemory() < committed_memory_before);
-  size_t shrinked_size =
-      RoundUp((array->address() - chunk->address()) + array->Size(),
-              base::OS::CommitPageSize());
+  size_t shrinked_size = RoundUp(
+      (array->address() - chunk->address()) + array->Size(), CommitPageSize());
   CHECK_EQ(shrinked_size, chunk->CommittedPhysicalMemory());
 }
 
@@ -5779,10 +5801,10 @@ Handle<Code> GenerateDummyImmovableCode(Isolate* isolate) {
 
   CodeDesc desc;
   assm.GetCode(isolate, &desc);
-  const bool kImmovable = true;
   Handle<Code> code = isolate->factory()->NewCode(
-      desc, Code::STUB, Handle<Code>(), HandlerTable::Empty(isolate),
-      MaybeHandle<ByteArray>(), DeoptimizationData::Empty(isolate), kImmovable);
+      desc, Code::STUB, Handle<Code>(), Builtins::kNoBuiltinId,
+      HandlerTable::Empty(isolate), MaybeHandle<ByteArray>(),
+      DeoptimizationData::Empty(isolate), kImmovable);
   CHECK(code->IsCode());
 
   return code;
@@ -5932,6 +5954,50 @@ UNINITIALIZED_TEST(ReinitializeStringHashSeed) {
   }
 }
 
+HEAP_TEST(Regress779503) {
+  // The following regression test ensures that the Scavenger does not allocate
+  // over invalid slots. More specific, the Scavenger should not sweep a page
+  // that it currently processes because it might allocate over the currently
+  // processed slot.
+  const int kArraySize = 2048;
+  CcTest::InitializeVM();
+  Isolate* isolate = CcTest::i_isolate();
+  Heap* heap = CcTest::heap();
+  heap::SealCurrentObjects(heap);
+  {
+    HandleScope handle_scope(isolate);
+    // The byte array filled with kHeapObjectTag ensures that we cannot read
+    // from the slot again and interpret it as heap value. Doing so will crash.
+    Handle<ByteArray> byte_array = isolate->factory()->NewByteArray(kArraySize);
+    CHECK(heap->InNewSpace(*byte_array));
+    for (int i = 0; i < kArraySize; i++) {
+      byte_array->set(i, kHeapObjectTag);
+    }
+
+    {
+      HandleScope handle_scope(isolate);
+      // The FixedArray in old space serves as space for slots.
+      Handle<FixedArray> fixed_array =
+          isolate->factory()->NewFixedArray(kArraySize, TENURED);
+      CHECK(!heap->InNewSpace(*fixed_array));
+      for (int i = 0; i < kArraySize; i++) {
+        fixed_array->set(i, *byte_array);
+      }
+    }
+    // Delay sweeper tasks to allow the scavenger to sweep the page it is
+    // currently scavenging.
+    CcTest::heap()->delay_sweeper_tasks_for_testing_ = true;
+    CcTest::CollectGarbage(OLD_SPACE);
+    CHECK(heap->InNewSpace(*byte_array));
+  }
+  // Scavenging and sweeping the same page will crash as slots will be
+  // overridden.
+  CcTest::CollectGarbage(NEW_SPACE);
+  CcTest::heap()->delay_sweeper_tasks_for_testing_ = false;
+}
+
 }  // namespace heap
 }  // namespace internal
 }  // namespace v8
+
+#undef __

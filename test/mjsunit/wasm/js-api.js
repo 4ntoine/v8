@@ -2,10 +2,18 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --expose-wasm
+// Flags: --expose-wasm --allow-natives-syntax
 
 load('test/mjsunit/wasm/wasm-constants.js');
 load('test/mjsunit/wasm/wasm-module-builder.js');
+
+function unexpectedSuccess() {
+  %AbortJS('unexpected success');
+}
+
+function unexpectedFail(error) {
+  %AbortJS('unexpected fail: ' + error);
+}
 
 function assertEq(val, expected) {
   assertSame(expected, val);
@@ -765,11 +773,10 @@ assertEq(compile.length, 1);
 assertEq(compile.name, 'compile');
 function assertCompileError(args, err, msg) {
   var error = null;
-  assertPromiseRejects(compile(...args))
-    .then(error => {
-      assertTrue(error instanceof err);
-        // TODO  assertTrue(Boolean(error.message.match(msg)));
-      });
+  assertPromiseResult(compile(...args), unexpectedSuccess, error => {
+    assertTrue(error instanceof err);
+    // TODO  assertTrue(Boolean(error.message.match(msg)));
+  });
 }
 assertCompileError([], TypeError, /requires more than 0 arguments/);
 assertCompileError(
@@ -792,8 +799,7 @@ assertCompileError(
 
 function assertCompileSuccess(bytes) {
   var module = null;
-  assertPromiseFulfills(compile(bytes))
-    .then(m => assertTrue(m instanceof Module));
+  assertPromiseResult(compile(bytes), m => assertTrue(m instanceof Module));
 }
 assertCompileSuccess(emptyModuleBinary);
 assertCompileSuccess(emptyModuleBinary.buffer);
@@ -813,11 +819,10 @@ assertEq(instantiate.length, 1);
 assertEq(instantiate.name, 'instantiate');
 function assertInstantiateError(args, err, msg) {
   var error = null;
-  assertPromiseRejects(instantiate(...args))
-    .then(error => {
-      assertTrue(error instanceof err);
-      // TODO assertTrue(Boolean(error.message.match(msg)));
-    });
+  assertPromiseResult(instantiate(...args), unexpectedSuccess, error => {
+    assertTrue(error instanceof err);
+    // TODO assertTrue(Boolean(error.message.match(msg)));
+  });
 }
 var scratch_memory = new WebAssembly.Memory(new ArrayBuffer(10));
 assertInstantiateError([], TypeError, /requires more than 0 arguments/);
@@ -871,15 +876,14 @@ assertInstantiateError(
 
 function assertInstantiateSuccess(module_or_bytes, imports) {
   var result = null;
-  assertPromiseFulfills(instantiate(module_or_bytes, imports))
-    .then(result => {
-      if (module_or_bytes instanceof Module) {
-        assertTrue(result instanceof Instance);
-      } else {
-        assertTrue(result.module instanceof Module);
-        assertTrue(result.instance instanceof Instance);
-      }
-    });
+  assertPromiseResult(instantiate(module_or_bytes, imports), result => {
+    if (module_or_bytes instanceof Module) {
+      assertTrue(result instanceof Instance);
+    } else {
+      assertTrue(result.module instanceof Module);
+      assertTrue(result.instance instanceof Instance);
+    }
+  });
 }
 assertInstantiateSuccess(emptyModule);
 assertInstantiateSuccess(emptyModuleBinary);
@@ -902,4 +906,22 @@ assertInstantiateSuccess(
 
   class Y extends WebAssembly.Memory { }
   assertThrows(() => new Y());
+})();
+
+(function TestCallWithoutNew() {
+  var bytes = Uint8Array.of(0x0, 0x61, 0x73, 0x6d, 0x1, 0x00, 0x00, 0x00);
+  assertThrows(() => WebAssembly.Module(bytes), TypeError);
+  assertThrows(() => WebAssembly.Instance(new WebAssembly.Module(bytes)),
+               TypeError);
+  assertThrows(() => WebAssembly.Table({size: 10, element: 'anyfunc'}),
+               TypeError);
+  assertThrows(() => WebAssembly.Memory({size: 10}), TypeError);
+})();
+
+(function TestTinyModule() {
+  var bytes = Uint8Array.of(0x0, 0x61, 0x73, 0x6d, 0x1, 0x00, 0x00, 0x00);
+  var module = new WebAssembly.Module(bytes);
+  assertTrue(module instanceof Module);
+  var instance = new WebAssembly.Instance(module);
+  assertTrue(instance instanceof Instance);
 })();

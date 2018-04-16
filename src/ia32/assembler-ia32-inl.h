@@ -56,7 +56,8 @@ static const int kNoCodeAgeSequenceLength = 5;
 
 // The modes possibly affected by apply must be in kApplyMask.
 void RelocInfo::apply(intptr_t delta) {
-  if (IsRuntimeEntry(rmode_) || IsCodeTarget(rmode_)) {
+  if (IsRuntimeEntry(rmode_) || IsCodeTarget(rmode_) ||
+      rmode_ == RelocInfo::JS_TO_WASM_CALL) {
     int32_t* p = reinterpret_cast<int32_t*>(pc_);
     *p -= delta;  // Relocate entry.
   } else if (IsInternalReference(rmode_)) {
@@ -68,14 +69,13 @@ void RelocInfo::apply(intptr_t delta) {
 
 
 Address RelocInfo::target_address() {
-  DCHECK(IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_));
-  return Assembler::target_address_at(pc_, host_);
+  DCHECK(IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_) || IsWasmCall(rmode_));
+  return Assembler::target_address_at(pc_, constant_pool_);
 }
 
 Address RelocInfo::target_address_address() {
-  DCHECK(IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_)
-                              || rmode_ == EMBEDDED_OBJECT
-                              || rmode_ == EXTERNAL_REFERENCE);
+  DCHECK(IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_) || IsWasmCall(rmode_) ||
+         rmode_ == EMBEDDED_OBJECT || rmode_ == EXTERNAL_REFERENCE);
   return reinterpret_cast<Address>(pc_);
 }
 
@@ -153,7 +153,7 @@ void RelocInfo::WipeOut(Isolate* isolate) {
     Memory::Address_at(pc_) = nullptr;
   } else if (IsCodeTarget(rmode_) || IsRuntimeEntry(rmode_)) {
     // Effectively write zero into the relocation.
-    Assembler::set_target_address_at(isolate, pc_, host_,
+    Assembler::set_target_address_at(isolate, pc_, constant_pool_,
                                      pc_ + sizeof(int32_t));
   } else {
     UNREACHABLE();
@@ -261,25 +261,14 @@ void Assembler::set_target_address_at(Isolate* isolate, Address pc,
   }
 }
 
-Address Assembler::target_address_at(Address pc, Code* code) {
-  Address constant_pool = code ? code->constant_pool() : nullptr;
-  return target_address_at(pc, constant_pool);
-}
-
-void Assembler::set_target_address_at(Isolate* isolate, Address pc, Code* code,
-                                      Address target,
-                                      ICacheFlushMode icache_flush_mode) {
-  Address constant_pool = code ? code->constant_pool() : nullptr;
-  set_target_address_at(isolate, pc, constant_pool, target);
-}
-
 Address Assembler::target_address_from_return_address(Address pc) {
   return pc - kCallTargetAddressOffset;
 }
 
 void Assembler::deserialization_set_special_target_at(
     Isolate* isolate, Address instruction_payload, Code* code, Address target) {
-  set_target_address_at(isolate, instruction_payload, code, target);
+  set_target_address_at(isolate, instruction_payload,
+                        code ? code->constant_pool() : nullptr, target);
 }
 
 Displacement Assembler::disp_at(Label* L) {

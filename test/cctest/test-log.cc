@@ -34,6 +34,7 @@
 #include <cmath>
 #endif  // __linux__
 
+#include <unordered_set>
 #include "src/api.h"
 #include "src/log-utils.h"
 #include "src/log.h"
@@ -69,15 +70,15 @@ static const char* StrNStr(const char* s1, const char* s2, size_t n) {
 }
 
 // Look for a log line which starts with {prefix} and ends with {suffix}.
-static const char* FindLogLine(i::Vector<const char>* log, const char* prefix,
+static const char* FindLogLine(const char* start, const char* end,
+                               const char* prefix,
                                const char* suffix = nullptr) {
-  const char* start = log->start();
-  const char* end = start + log->length();
+  CHECK_LT(start, end);
   CHECK_EQ(end[0], '\0');
   size_t prefixLength = strlen(prefix);
   // Loop through the input until we find /{prefix}[^\n]+{suffix}/.
   while (start < end) {
-    const char* prefixResult = StrNStr(start, prefix, (end - start));
+    const char* prefixResult = strstr(start, prefix);
     if (!prefixResult) return NULL;
     if (suffix == nullptr) return prefixResult;
     const char* suffixResult =
@@ -123,7 +124,24 @@ class ScopedLoggerInitializer {
 
   Logger* logger() { return logger_; }
 
-  void PrintLog() { printf("%s", log_.start()); }
+  void PrintLog(int nofLines = 0) {
+    if (nofLines <= 0) {
+      printf("%s", log_.start());
+      return;
+    }
+    // Try to print the last {nofLines} of the log.
+    const char* start = log_.start();
+    const char* current = log_.end();
+    while (current > start && nofLines > 0) {
+      current--;
+      if (*current == '\n') nofLines--;
+    }
+    printf(
+        "======================================================\n"
+        "Last log lines:\n...%s\n"
+        "======================================================\n",
+        current);
+  }
 
   v8::Local<v8::String> GetLogString() {
     return v8::String::NewFromUtf8(isolate_, log_.start(),
@@ -137,14 +155,78 @@ class ScopedLoggerInitializer {
     CHECK(exists);
   }
 
-  const char* FindLine(const char* prefix, const char* suffix = nullptr) {
-    return FindLogLine(&log_, prefix, suffix);
+  const char* FindLine(const char* prefix, const char* suffix = nullptr,
+                       const char* start = nullptr) {
+    // Make sure that StopLogging() has been called before.
+    CHECK(log_.size());
+    if (start == nullptr) start = log_.start();
+    const char* end = log_.start() + log_.length();
+    return FindLogLine(start, end, prefix, suffix);
+  }
+
+  // Find all log lines specified by the {prefix, suffix} pairs and ensure they
+  // occurr in the specified order.
+  void FindLogLines(const char* pairs[][2], size_t limit,
+                    const char* start = nullptr) {
+    const char* prefix = pairs[0][0];
+    const char* suffix = pairs[0][1];
+    const char* last_position = FindLine(prefix, suffix, start);
+    if (last_position == nullptr) {
+      PrintLog(50);
+      V8_Fatal(__FILE__, __LINE__, "Could not find log line: %s ... %s", prefix,
+               suffix);
+    }
+    CHECK(last_position);
+    for (size_t i = 1; i < limit; i++) {
+      prefix = pairs[i][0];
+      suffix = pairs[i][1];
+      const char* position = FindLine(prefix, suffix, start);
+      if (position == nullptr) {
+        PrintLog(50);
+        V8_Fatal(__FILE__, __LINE__, "Could not find log line: %s ... %s",
+                 prefix, suffix);
+      }
+      // Check that all string positions are in order.
+      if (position <= last_position) {
+        PrintLog(50);
+        V8_Fatal(__FILE__, __LINE__,
+                 "Log statements not in expected order (prev=%p, current=%p): "
+                 "%s ... %s",
+                 reinterpret_cast<const void*>(last_position),
+                 reinterpret_cast<const void*>(position), prefix, suffix);
+      }
+      last_position = position;
+    }
   }
 
   void LogCompiledFunctions() { logger_->LogCompiledFunctions(); }
 
   void StringEvent(const char* name, const char* value) {
     logger_->StringEvent(name, value);
+  }
+
+  void ExtractAllAddresses(std::unordered_set<uintptr_t>* map,
+                           const char* prefix, int field_index) {
+    // Make sure that StopLogging() has been called before.
+    CHECK(log_.size());
+    const char* current = log_.start();
+    while (current != nullptr) {
+      current = FindLine(prefix, nullptr, current);
+      if (current == nullptr) return;
+      // Find token number {index}.
+      const char* previous;
+      for (int i = 0; i <= field_index; i++) {
+        previous = current;
+        current = strchr(current + 1, ',');
+        if (current == nullptr) break;
+        // Skip the comma.
+        current++;
+      }
+      if (current == nullptr) break;
+      uintptr_t address = strtoll(previous, nullptr, 16);
+      CHECK_LT(0, address);
+      map->insert(address);
+    }
   }
 
  private:
@@ -177,21 +259,22 @@ TEST(FindLogLine) {
       "prefix2, stuff\n, suffix2\n"
       "prefix3suffix3\n"
       "prefix4 suffix4";
+  const char* end = string + strlen(string);
   // Make sure the vector contains the terminating \0 character.
-  i::Vector<const char> log(string, strlen(string));
-  CHECK(FindLogLine(&log, "prefix1, stuff,   suffix1"));
-  CHECK(FindLogLine(&log, "prefix1, stuff"));
-  CHECK(FindLogLine(&log, "prefix1"));
-  CHECK(FindLogLine(&log, "prefix1", "suffix1"));
-  CHECK(FindLogLine(&log, "prefix1", "suffix1"));
-  CHECK(!FindLogLine(&log, "prefix2", "suffix2"));
-  CHECK(!FindLogLine(&log, "prefix1", "suffix2"));
-  CHECK(!FindLogLine(&log, "prefix1", "suffix3"));
-  CHECK(FindLogLine(&log, "prefix3", "suffix3"));
-  CHECK(FindLogLine(&log, "prefix4", "suffix4"));
-  CHECK(!FindLogLine(&log, "prefix4", "suffix4XXXXXXXXXXXX"));
-  CHECK(!FindLogLine(&log, "prefix4XXXXXXXXXXXXXXXXXXXXXXxxx", "suffix4"));
-  CHECK(!FindLogLine(&log, "suffix", "suffix5XXXXXXXXXXXXXXXXXXXX"));
+  CHECK(FindLogLine(string, end, "prefix1, stuff,   suffix1"));
+  CHECK(FindLogLine(string, end, "prefix1, stuff"));
+  CHECK(FindLogLine(string, end, "prefix1"));
+  CHECK(FindLogLine(string, end, "prefix1", "suffix1"));
+  CHECK(FindLogLine(string, end, "prefix1", "suffix1"));
+  CHECK(!FindLogLine(string, end, "prefix2", "suffix2"));
+  CHECK(!FindLogLine(string, end, "prefix1", "suffix2"));
+  CHECK(!FindLogLine(string, end, "prefix1", "suffix3"));
+  CHECK(FindLogLine(string, end, "prefix3", "suffix3"));
+  CHECK(FindLogLine(string, end, "prefix4", "suffix4"));
+  CHECK(!FindLogLine(string, end, "prefix4", "suffix4XXXXXXXXXXXX"));
+  CHECK(
+      !FindLogLine(string, end, "prefix4XXXXXXXXXXXXXXXXXXXXXXxxx", "suffix4"));
+  CHECK(!FindLogLine(string, end, "suffix", "suffix5XXXXXXXXXXXXXXXXXXXX"));
 }
 
 // BUG(913). Need to implement support for profiling multiple VM threads.
@@ -565,14 +648,12 @@ TEST(EquivalenceOfLoggingAndTraversal) {
     v8::Local<v8::Script> script = CompileWithOrigin(source_str, "");
     if (script.IsEmpty()) {
       v8::String::Utf8Value exception(isolate, try_catch.Exception());
-      printf("compile: %s\n", *exception);
-      CHECK(false);
+      FATAL("compile: %s\n", *exception);
     }
     v8::Local<v8::Value> result;
     if (!script->Run(logger.env()).ToLocal(&result)) {
       v8::String::Utf8Value exception(isolate, try_catch.Exception());
-      printf("run: %s\n", *exception);
-      CHECK(false);
+      FATAL("run: %s\n", *exception);
     }
     // The result either be the "true" literal or problem description.
     if (!result->IsTrue()) {
@@ -580,10 +661,7 @@ TEST(EquivalenceOfLoggingAndTraversal) {
       i::ScopedVector<char> data(s->Utf8Length() + 1);
       CHECK(data.start());
       s->WriteUtf8(data.start());
-      printf("%s\n", data.start());
-      // Make sure that our output is written prior crash due to CHECK failure.
-      fflush(stdout);
-      CHECK(false);
+      FATAL("%s\n", data.start());
     }
   }
   isolate->Dispose();
@@ -695,5 +773,185 @@ TEST(LogAll) {
       CHECK(logger.FindLine("timer-event-end", "V8.DeoptimizeCode"));
     }
   }
+  isolate->Dispose();
+}
+
+TEST(TraceMaps) {
+  SETUP_FLAGS();
+  i::FLAG_trace_maps = true;
+  v8::Isolate::CreateParams create_params;
+  create_params.array_buffer_allocator = CcTest::array_buffer_allocator();
+  v8::Isolate* isolate = v8::Isolate::New(create_params);
+  {
+    ScopedLoggerInitializer logger(saved_log, saved_prof, isolate);
+    // Try to create many different kind of maps to make sure the logging won't
+    // crash. More detailed tests are implemented separately.
+    const char* source_text =
+        "let a = {};"
+        "for (let i = 0; i < 500; i++) { a['p'+i] = i };"
+        "class Test { constructor(i) { this.a = 1; this['p'+i] = 1; }};"
+        "let t = new Test();"
+        "t.b = 1; t.c = 1; t.d = 3;"
+        "for (let i = 0; i < 100; i++) { t = new Test(i) };"
+        "t.b = {};";
+    CompileRun(source_text);
+
+    logger.StopLogging();
+
+    // Mostly superficial checks.
+    CHECK(logger.FindLine("map,InitialMap", ",0x"));
+    CHECK(logger.FindLine("map,Transition", ",0x"));
+    CHECK(logger.FindLine("map-details", ",0x"));
+  }
+  i::FLAG_trace_maps = false;
+  isolate->Dispose();
+}
+
+TEST(LogMaps) {
+  // Test that all Map details from Maps in the snapshot are logged properly.
+  SETUP_FLAGS();
+  i::FLAG_trace_maps = true;
+  v8::Isolate::CreateParams create_params;
+  create_params.array_buffer_allocator = CcTest::array_buffer_allocator();
+  v8::Isolate* isolate = v8::Isolate::New(create_params);
+  {
+    ScopedLoggerInitializer logger(saved_log, saved_prof, isolate);
+    logger.StopLogging();
+    // Extract all the map-detail entry addresses from the log.
+    std::unordered_set<uintptr_t> map_addresses;
+    logger.ExtractAllAddresses(&map_addresses, "map-details", 2);
+    i::Heap* heap = reinterpret_cast<i::Isolate*>(isolate)->heap();
+    i::HeapIterator iterator(heap);
+    i::DisallowHeapAllocation no_gc;
+
+    // Iterate over all maps on the heap.
+    size_t i = 0;
+    for (i::HeapObject* obj = iterator.next(); obj != nullptr;
+         obj = iterator.next()) {
+      i++;
+      if (!obj->IsMap()) continue;
+      uintptr_t address = reinterpret_cast<uintptr_t>(obj);
+      if (map_addresses.find(address) != map_addresses.end()) continue;
+      logger.PrintLog(200);
+      i::Map::cast(obj)->Print();
+      V8_Fatal(__FILE__, __LINE__,
+               "Map (%p, #%zu) was not logged during startup with --trace-maps!"
+               "\n# Expected Log Line: map_details, ... %p"
+               "\n# Use logger::PrintLog() for more details.",
+               reinterpret_cast<void*>(obj), i, reinterpret_cast<void*>(obj));
+    }
+    logger.PrintLog(200);
+  }
+  i::FLAG_log_function_events = false;
+  isolate->Dispose();
+}
+
+TEST(ConsoleTimeEvents) {
+  SETUP_FLAGS();
+  v8::Isolate::CreateParams create_params;
+  create_params.array_buffer_allocator = CcTest::array_buffer_allocator();
+  v8::Isolate* isolate = v8::Isolate::New(create_params);
+  {
+    ScopedLoggerInitializer logger(saved_log, saved_prof, isolate);
+    // Test that console time events are properly logged
+    const char* source_text =
+        "console.time();"
+        "console.timeEnd();"
+        "console.timeStamp();"
+        "console.time('timerEvent1');"
+        "console.timeEnd('timerEvent1');"
+        "console.timeStamp('timerEvent2');"
+        "console.timeStamp('timerEvent3');";
+    CompileRun(source_text);
+
+    logger.StopLogging();
+
+    const char* pairs[][2] = {{"timer-event-start,default,", nullptr},
+                              {"timer-event-end,default,", nullptr},
+                              {"timer-event,default,", nullptr},
+                              {"timer-event-start,timerEvent1,", nullptr},
+                              {"timer-event-end,timerEvent1,", nullptr},
+                              {"timer-event,timerEvent2,", nullptr},
+                              {"timer-event,timerEvent3,", nullptr}};
+    logger.FindLogLines(pairs, arraysize(pairs));
+  }
+
+  isolate->Dispose();
+}
+
+TEST(LogFunctionEvents) {
+  // Always opt and stress opt will break the fine-grained log order.
+  if (i::FLAG_always_opt) return;
+
+  SETUP_FLAGS();
+  i::FLAG_log_function_events = true;
+  v8::Isolate::CreateParams create_params;
+  create_params.array_buffer_allocator = CcTest::array_buffer_allocator();
+  v8::Isolate* isolate = v8::Isolate::New(create_params);
+  {
+    ScopedLoggerInitializer logger(saved_log, saved_prof, isolate);
+    const char* source_text =
+        "function lazyNotExecutedFunction() { return 'lazy' };"
+        "function lazyFunction() { "
+        "  function lazyInnerFunction() { return 'lazy' };"
+        "  return lazyInnerFunction;"
+        "};"
+        "let innerFn = lazyFunction();"
+        "innerFn();"
+        "(function eagerFunction(){ return 'eager' })();"
+        "function Foo() { this.foo = function(){}; };"
+        "let i = new Foo(); i.foo();";
+    CompileRun(source_text);
+
+    logger.StopLogging();
+
+    // TODO(cbruni): Extend with first-execution log statements.
+    CHECK_NULL(
+        logger.FindLine("function,compile-lazy,", ",lazyNotExecutedFunction"));
+    // Only consider the log starting from the first preparse statement on.
+    const char* start =
+        logger.FindLine("function,preparse-", ",lazyNotExecutedFunction");
+    const char* pairs[][2] = {
+        // Step 1: parsing top-level script, preparsing functions
+        {"function,preparse-", ",lazyNotExecutedFunction"},
+        // Missing name for preparsing lazyInnerFunction
+        // {"function,preparse-", nullptr},
+        {"function,preparse-", ",lazyFunction"},
+        {"function,full-parse,", ",eagerFunction"},
+        {"function,preparse-", ",Foo"},
+        // Missing name for inner preparsing of Foo.foo
+        // {"function,preparse-", nullptr},
+        // Missing name for top-level script.
+        {"function,parse-script,", nullptr},
+
+        // Step 2: compiling top-level script and eager functions
+        // - Compiling script without name.
+        {"function,compile,,", nullptr},
+        {"function,compile,", ",eagerFunction"},
+
+        // Step 3: start executing script
+        // Step 4. - lazy parse, lazy compiling and execute skipped functions
+        //         - execute eager functions.
+        {"function,parse-function,", ",lazyFunction"},
+        {"function,compile-lazy,", ",lazyFunction"},
+        {"function,first-execution,", ",lazyFunction"},
+
+        {"function,parse-function,", ",lazyInnerFunction"},
+        {"function,compile-lazy,", ",lazyInnerFunction"},
+        {"function,first-execution,", ",lazyInnerFunction"},
+
+        {"function,first-execution,", ",eagerFunction"},
+
+        {"function,parse-function,", ",Foo"},
+        {"function,compile-lazy,", ",Foo"},
+        {"function,first-execution,", ",Foo"},
+
+        {"function,parse-function,", ",Foo.foo"},
+        {"function,compile-lazy,", ",Foo.foo"},
+        {"function,first-execution,", ",Foo.foo"},
+    };
+    logger.FindLogLines(pairs, arraysize(pairs), start);
+  }
+  i::FLAG_log_function_events = false;
   isolate->Dispose();
 }

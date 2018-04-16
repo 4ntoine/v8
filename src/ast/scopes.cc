@@ -147,8 +147,6 @@ Scope::Scope(Zone* zone, Scope* outer_scope, ScopeType scope_type)
   DCHECK_NE(SCRIPT_SCOPE, scope_type);
   SetDefaults();
   set_language_mode(outer_scope->language_mode());
-  force_context_allocation_ =
-      !is_function_scope() && outer_scope->has_forced_context_allocation();
   outer_scope_->AddInnerScope(this);
 }
 
@@ -605,12 +603,10 @@ void DeclarationScope::HoistSloppyBlockFunctions(AstNodeFactory* factory) {
       auto declaration =
           factory->NewVariableDeclaration(proxy, kNoSourcePosition);
       // Based on the preceding checks, it doesn't matter what we pass as
-      // allow_harmony_restrictive_generators and
       // sloppy_mode_block_scope_function_redefinition.
       bool ok = true;
       DeclareVariable(declaration, VAR,
-                      Variable::DefaultInitializationFlag(VAR), false, nullptr,
-                      &ok);
+                      Variable::DefaultInitializationFlag(VAR), nullptr, &ok);
       DCHECK(ok);
     } else {
       DCHECK(is_being_lazily_parsed_);
@@ -648,8 +644,11 @@ void DeclarationScope::AttachOuterScopeInfo(ParseInfo* info, Isolate* isolate) {
 }
 
 void DeclarationScope::Analyze(ParseInfo* info) {
-  RuntimeCallTimerScope runtimeTimer(info->runtime_call_stats(),
-                                     &RuntimeCallStats::CompileScopeAnalysis);
+  RuntimeCallTimerScope runtimeTimer(
+      info->runtime_call_stats(),
+      info->on_background_thread()
+          ? RuntimeCallCounterId::kCompileBackgroundScopeAnalysis
+          : RuntimeCallCounterId::kCompileScopeAnalysis);
   DCHECK_NOT_NULL(info->literal());
   DeclarationScope* scope = info->literal()->scope();
 
@@ -1078,7 +1077,6 @@ Variable* Scope::DeclareLocal(const AstRawString* name, VariableMode mode,
 
 Variable* Scope::DeclareVariable(
     Declaration* declaration, VariableMode mode, InitializationFlag init,
-    bool allow_harmony_restrictive_generators,
     bool* sloppy_mode_block_scope_function_redefinition, bool* ok) {
   DCHECK(IsDeclaredVariableMode(mode));
   DCHECK(!already_resolved_);
@@ -1087,8 +1085,8 @@ Variable* Scope::DeclareVariable(
 
   if (mode == VAR && !is_declaration_scope()) {
     return GetDeclarationScope()->DeclareVariable(
-        declaration, mode, init, allow_harmony_restrictive_generators,
-        sloppy_mode_block_scope_function_redefinition, ok);
+        declaration, mode, init, sloppy_mode_block_scope_function_redefinition,
+        ok);
   }
   DCHECK(!is_catch_scope());
   DCHECK(!is_with_scope());
@@ -1149,8 +1147,7 @@ Variable* Scope::DeclareVariable(
                             map->Lookup(const_cast<AstRawString*>(name),
                                         name->Hash()) != nullptr &&
                             !IsAsyncFunction(function_kind) &&
-                            !(allow_harmony_restrictive_generators &&
-                              IsGeneratorFunction(function_kind));
+                            !IsGeneratorFunction(function_kind);
       }
       if (duplicate_allowed) {
         *sloppy_mode_block_scope_function_redefinition = true;
@@ -1371,12 +1368,8 @@ bool Scope::AllowsLazyParsingWithoutUnresolvedVariables(
     if (s->is_catch_scope()) continue;
     // With scopes do not introduce variables that need allocation.
     if (s->is_with_scope()) continue;
-    // Module scopes context-allocate all variables, and have no
-    // {this} or {arguments} variables whose existence depends on
-    // references to them.
-    if (s->is_module_scope()) continue;
-    // Only block scopes and function scopes should disallow preparsing.
-    DCHECK(s->is_block_scope() || s->is_function_scope());
+    DCHECK(s->is_module_scope() || s->is_block_scope() ||
+           s->is_function_scope());
     return false;
   }
   return true;
@@ -1442,6 +1435,10 @@ bool Scope::NeedsScopeInfo() const {
   // TODO(jochen|yangguo): Remove this requirement.
   if (is_function_scope()) return true;
   return NeedsContext();
+}
+
+bool Scope::ShouldBanArguments() {
+  return GetReceiverScope()->should_ban_arguments();
 }
 
 DeclarationScope* Scope::GetReceiverScope() {
@@ -1734,9 +1731,6 @@ void Scope::Print(int n) {
     DeclarationScope* scope = AsDeclarationScope();
     if (scope->was_lazily_parsed()) Indent(n1, "// lazily parsed\n");
     if (scope->ShouldEagerCompile()) Indent(n1, "// will be compiled\n");
-  }
-  if (has_forced_context_allocation()) {
-    Indent(n1, "// forces context allocation\n");
   }
   if (num_stack_slots_ > 0) {
     Indent(n1, "// ");
@@ -2112,11 +2106,8 @@ bool Scope::MustAllocateInContext(Variable* var) {
   // an eval() call or a runtime with lookup), it must be allocated in the
   // context.
   //
-  // Exceptions: If the scope as a whole has forced context allocation, all
-  // variables will have context allocation, even temporaries.  Otherwise
-  // temporary variables are always stack-allocated.  Catch-bound variables are
+  // Temporary variables are always stack-allocated.  Catch-bound variables are
   // always context-allocated.
-  if (has_forced_context_allocation()) return true;
   if (var->mode() == TEMPORARY) return false;
   if (is_catch_scope()) return true;
   if ((is_script_scope() || is_eval_scope()) &&
@@ -2236,8 +2227,10 @@ void DeclarationScope::AllocateLocals() {
   // allocated in the context, it must be the last slot in the context,
   // because of the current ScopeInfo implementation (see
   // ScopeInfo::ScopeInfo(FunctionScope* scope) constructor).
-  if (function_ != nullptr) {
+  if (function_ != nullptr && MustAllocate(function_)) {
     AllocateNonParameterLocal(function_);
+  } else {
+    function_ = nullptr;
   }
 
   DCHECK(!has_rest_ || !MustAllocate(rest_parameter()) ||

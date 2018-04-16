@@ -131,7 +131,7 @@ void Parser::RewriteDestructuringAssignment(RewritableExpression* to_rewrite) {
 Expression* Parser::RewriteDestructuringAssignment(Assignment* assignment) {
   DCHECK_NOT_NULL(assignment);
   DCHECK_EQ(Token::ASSIGN, assignment->op());
-  auto to_rewrite = factory()->NewRewritableExpression(assignment);
+  auto to_rewrite = factory()->NewRewritableExpression(assignment, scope());
   RewriteDestructuringAssignment(to_rewrite);
   return to_rewrite->expression();
 }
@@ -445,6 +445,11 @@ void PatternRewriter::VisitArrayLiteral(ArrayLiteral* node,
   auto iterator = CreateTempVar(factory()->NewGetIterator(
       factory()->NewVariableProxy(temp), current_value_, IteratorType::kNormal,
       current_value_->position()));
+  auto next = CreateTempVar(factory()->NewProperty(
+      factory()->NewVariableProxy(iterator),
+      factory()->NewStringLiteral(ast_value_factory()->next_string(),
+                                  kNoSourcePosition),
+      kNoSourcePosition));
   auto done =
       CreateTempVar(factory()->NewBooleanLiteral(false, kNoSourcePosition));
   auto result = CreateTempVar();
@@ -525,7 +530,8 @@ void PatternRewriter::VisitArrayLiteral(ArrayLiteral* node,
       next_block->statements()->Add(
           factory()->NewExpressionStatement(
               parser_->BuildIteratorNextResult(
-                  factory()->NewVariableProxy(iterator), result,
+                  factory()->NewVariableProxy(iterator),
+                  factory()->NewVariableProxy(next), result,
                   IteratorType::kNormal, kNoSourcePosition),
               kNoSourcePosition),
           zone());
@@ -539,7 +545,7 @@ void PatternRewriter::VisitArrayLiteral(ArrayLiteral* node,
     }
     block_->statements()->Add(if_not_done, zone());
 
-    if (!(value->IsLiteral() && value->AsLiteral()->raw_value()->IsTheHole())) {
+    if (!value->IsTheHoleLiteral()) {
       {
         // completion = kAbruptCompletion;
         Expression* proxy = factory()->NewVariableProxy(completion);
@@ -599,6 +605,7 @@ void PatternRewriter::VisitArrayLiteral(ArrayLiteral* node,
     // result = IteratorNext(iterator);
     Statement* get_next = factory()->NewExpressionStatement(
         parser_->BuildIteratorNextResult(factory()->NewVariableProxy(iterator),
+                                         factory()->NewVariableProxy(next),
                                          result, IteratorType::kNormal, nopos),
         nopos);
 
@@ -726,6 +733,7 @@ void PatternRewriter::VisitProperty(v8::internal::Property* node) {
   void PatternRewriter::Visit##Node(v8::internal::Node*) { UNREACHABLE(); }
 
 NOT_A_PATTERN(BinaryOperation)
+NOT_A_PATTERN(NaryOperation)
 NOT_A_PATTERN(Block)
 NOT_A_PATTERN(BreakStatement)
 NOT_A_PATTERN(Call)
@@ -755,6 +763,7 @@ NOT_A_PATTERN(ImportCallExpression)
 NOT_A_PATTERN(Literal)
 NOT_A_PATTERN(NativeFunctionLiteral)
 NOT_A_PATTERN(RegExpLiteral)
+NOT_A_PATTERN(ResolvedProperty)
 NOT_A_PATTERN(ReturnStatement)
 NOT_A_PATTERN(SloppyBlockFunctionStatement)
 NOT_A_PATTERN(Spread)

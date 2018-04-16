@@ -28,7 +28,8 @@ class BytecodeJumpTable;
 
 class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
  public:
-  explicit BytecodeGenerator(CompilationInfo* info);
+  explicit BytecodeGenerator(CompilationInfo* info,
+                             const AstStringConstants* ast_string_constants);
 
   void GenerateBytecode(uintptr_t stack_limit);
   Handle<BytecodeArray> FinalizeBytecode(Isolate* isolate,
@@ -55,6 +56,8 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   class EffectResultScope;
   class FeedbackSlotCache;
   class GlobalDeclarationsBuilder;
+  class IteratorRecord;
+  class NaryCodeCoverageSlots;
   class RegisterAllocationScope;
   class TestResultScope;
   class ValueResultScope;
@@ -74,6 +77,12 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   void VisitCommaExpression(BinaryOperation* binop);
   void VisitLogicalOrExpression(BinaryOperation* binop);
   void VisitLogicalAndExpression(BinaryOperation* binop);
+
+  // Dispatched from VisitNaryOperation.
+  void VisitNaryArithmeticExpression(NaryOperation* expr);
+  void VisitNaryCommaExpression(NaryOperation* expr);
+  void VisitNaryLogicalOrExpression(NaryOperation* expr);
+  void VisitNaryLogicalAndExpression(NaryOperation* expr);
 
   // Dispatched from VisitUnaryOperation.
   void VisitVoid(UnaryOperation* expr);
@@ -143,16 +152,35 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
 
   void BuildGetIterator(Expression* iterable, IteratorType hint);
 
+  // Create an IteratorRecord with pre-allocated registers holding the next
+  // method and iterator object.
+  IteratorRecord BuildGetIteratorRecord(Expression* iterable,
+                                        Register iterator_next,
+                                        Register iterator_object,
+                                        IteratorType hint);
+
+  // Create an IteratorRecord allocating new registers to hold the next method
+  // and iterator object.
+  IteratorRecord BuildGetIteratorRecord(Expression* iterable,
+                                        IteratorType hint);
+  void BuildIteratorNext(const IteratorRecord& iterator, Register next_result);
+  void BuildIteratorClose(const IteratorRecord& iterator, int suspend_id = -1);
+  void BuildCallIteratorMethod(Register iterator, const AstRawString* method,
+                               RegisterList receiver_and_args,
+                               BytecodeLabel* if_called,
+                               BytecodeLabels* if_notcalled);
+
+  void BuildArrayLiteralSpread(Spread* spread, Register array);
+
   void AllocateTopLevelRegisters();
   void VisitArgumentsObject(Variable* variable);
   void VisitRestArgumentsArray(Variable* rest);
   void VisitCallSuper(Call* call);
-  void VisitClassLiteralProperties(ClassLiteral* expr, Register constructor,
-                                   Register prototype);
-  void BuildClassLiteralNameProperty(ClassLiteral* expr, Register constructor);
   void BuildClassLiteral(ClassLiteral* expr);
   void VisitNewTargetVariable(Variable* variable);
   void VisitThisFunctionVariable(Variable* variable);
+  void BuildInstanceFieldInitialization(Register constructor,
+                                        Register instance);
   void BuildGeneratorObjectVariableInitialization();
   void VisitBlockDeclarationsAndStatements(Block* stmt);
   void VisitFunctionClosureForContext();
@@ -164,10 +192,25 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   void VisitForInAssignment(Expression* expr);
   void VisitModuleNamespaceImports();
 
-  // Builds a logical OR/AND within a test context by rewiring the jumps based
+  // Visit a logical OR/AND within a test context, rewiring the jumps based
   // on the expression values.
-  void BuildLogicalTest(Token::Value token, Expression* left,
-                        Expression* right);
+  void VisitLogicalTest(Token::Value token, Expression* left, Expression* right,
+                        int right_coverage_slot);
+  void VisitNaryLogicalTest(Token::Value token, NaryOperation* expr,
+                            const NaryCodeCoverageSlots* coverage_slots);
+  // Visit a (non-RHS) test for a logical op, which falls through if the test
+  // fails or jumps to the appropriate labels if it succeeds.
+  void VisitLogicalTestSubExpression(Token::Value token, Expression* expr,
+                                     BytecodeLabels* then_labels,
+                                     BytecodeLabels* else_labels,
+                                     int coverage_slot);
+
+  // Helpers for binary and nary logical op value expressions.
+  bool VisitLogicalOrSubExpression(Expression* expr, BytecodeLabels* end_labels,
+                                   int coverage_slot);
+  bool VisitLogicalAndSubExpression(Expression* expr,
+                                    BytecodeLabels* end_labels,
+                                    int coverage_slot);
 
   // Visit the header/body of a loop iteration.
   void VisitIterationHeader(IterationStatement* stmt,
@@ -184,6 +227,8 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   void BuildLoadPropertyKey(LiteralProperty* property, Register out_reg);
 
   int AllocateBlockCoverageSlotIfEnabled(AstNode* node, SourceRangeKind kind);
+  int AllocateNaryBlockCoverageSlotIfEnabled(NaryOperation* node, size_t index);
+
   void BuildIncrementBlockCoverageCounterIfEnabled(AstNode* node,
                                                    SourceRangeKind kind);
   void BuildIncrementBlockCoverageCounterIfEnabled(int coverage_array_slot);
@@ -225,7 +270,7 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
 
   inline Register generator_object() const;
 
-  inline BytecodeArrayBuilder* builder() const { return builder_; }
+  inline BytecodeArrayBuilder* builder() { return &builder_; }
   inline Zone* zone() const { return zone_; }
   inline DeclarationScope* closure_scope() const { return closure_scope_; }
   inline CompilationInfo* info() const { return info_; }
@@ -248,7 +293,7 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
     execution_result_ = execution_result;
   }
   ExpressionResultScope* execution_result() const { return execution_result_; }
-  BytecodeRegisterAllocator* register_allocator() const {
+  BytecodeRegisterAllocator* register_allocator() {
     return builder()->register_allocator();
   }
 
@@ -273,7 +318,7 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   }
 
   Zone* zone_;
-  BytecodeArrayBuilder* builder_;
+  BytecodeArrayBuilder builder_;
   CompilationInfo* info_;
   const AstStringConstants* ast_string_constants_;
   DeclarationScope* closure_scope_;
@@ -289,6 +334,7 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
       native_function_literals_;
   ZoneVector<std::pair<ObjectLiteral*, size_t>> object_literals_;
   ZoneVector<std::pair<ArrayLiteral*, size_t>> array_literals_;
+  ZoneVector<std::pair<ClassLiteral*, size_t>> class_literals_;
   ZoneVector<std::pair<GetTemplateObject*, size_t>> template_objects_;
 
   ControlScope* execution_control_;

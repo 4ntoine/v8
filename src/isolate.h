@@ -109,7 +109,7 @@ class Interpreter;
 }
 
 namespace wasm {
-class CompilationManager;
+class WasmEngine;
 }
 
 #define RETURN_FAILURE_IF_SCHEDULED_EXCEPTION(isolate) \
@@ -330,12 +330,12 @@ class ThreadLocalTop BASE_EMBEDDED {
   Object* pending_exception_;
   // TODO(kschimpf): Change this to a stack of caught exceptions (rather than
   // just innermost catching try block).
-  Object* wasm_caught_exception_;
+  Object* wasm_caught_exception_ = nullptr;
 
   // Communication channel between Isolate::FindHandler and the CEntryStub.
   Context* pending_handler_context_;
-  Code* pending_handler_code_;
-  intptr_t pending_handler_offset_;
+  Address pending_handler_entrypoint_;
+  Address pending_handler_constant_pool_;
   Address pending_handler_fp_;
   Address pending_handler_sp_;
 
@@ -372,6 +372,9 @@ class ThreadLocalTop BASE_EMBEDDED {
   // Call back function to report unsafe JS accesses.
   v8::FailedAccessCheckCallback failed_access_check_callback_;
 
+  int microtask_queue_bailout_index_;
+  int microtask_queue_bailout_count_;
+
  private:
   void InitializeInternal();
 
@@ -381,10 +384,8 @@ class ThreadLocalTop BASE_EMBEDDED {
 
 #if USE_SIMULATOR
 
-#define ISOLATE_INIT_SIMULATOR_LIST(V)                       \
-  V(bool, simulator_initialized, false)                      \
-  V(base::CustomMatcherHashMap*, simulator_i_cache, nullptr) \
-  V(Redirection*, simulator_redirection, nullptr)
+#define ISOLATE_INIT_SIMULATOR_LIST(V)  \
+  V(base::CustomMatcherHashMap*, simulator_i_cache, nullptr)
 #else
 
 #define ISOLATE_INIT_SIMULATOR_LIST(V)
@@ -420,6 +421,7 @@ typedef std::vector<HeapObject*> DebugObjectCache;
   V(OOMErrorCallback, oom_behavior, nullptr)                                  \
   V(LogEventCallback, event_logger, nullptr)                                  \
   V(AllowCodeGenerationFromStringsCallback, allow_code_gen_callback, nullptr) \
+  V(AllowWasmCodeGenerationCallback, allow_wasm_code_gen_callback, nullptr)   \
   V(ExtensionCallback, wasm_module_callback, &NoExtension)                    \
   V(ExtensionCallback, wasm_instance_callback, &NoExtension)                  \
   V(ApiImplementationCallback, wasm_compile_streaming_callback, nullptr)      \
@@ -619,8 +621,8 @@ class Isolate {
   inline bool has_pending_exception();
 
   THREAD_LOCAL_TOP_ADDRESS(Context*, pending_handler_context)
-  THREAD_LOCAL_TOP_ADDRESS(Code*, pending_handler_code)
-  THREAD_LOCAL_TOP_ADDRESS(intptr_t, pending_handler_offset)
+  THREAD_LOCAL_TOP_ADDRESS(Address, pending_handler_entrypoint)
+  THREAD_LOCAL_TOP_ADDRESS(Address, pending_handler_constant_pool)
   THREAD_LOCAL_TOP_ADDRESS(Address, pending_handler_fp)
   THREAD_LOCAL_TOP_ADDRESS(Address, pending_handler_sp)
 
@@ -671,6 +673,18 @@ class Isolate {
   }
   inline Address* js_entry_sp_address() {
     return &thread_local_top_.js_entry_sp_;
+  }
+
+  THREAD_LOCAL_TOP_ACCESSOR(int, microtask_queue_bailout_index)
+  Address microtask_queue_bailout_index_address() {
+    return reinterpret_cast<Address>(
+        &thread_local_top_.microtask_queue_bailout_index_);
+  }
+
+  THREAD_LOCAL_TOP_ACCESSOR(int, microtask_queue_bailout_count)
+  Address microtask_queue_bailout_count_address() {
+    return reinterpret_cast<Address>(
+        &thread_local_top_.microtask_queue_bailout_count_);
   }
 
   // Returns the global object of the current context. It could be
@@ -806,6 +820,11 @@ class Isolate {
   // Un-schedule an exception that was caught by a TryCatch handler.
   void CancelScheduledExceptionFromTryCatch(v8::TryCatch* handler);
   void ReportPendingMessages();
+  void ReportPendingMessagesFromJavaScript();
+
+  // Implements code shared between the two above methods
+  void ReportPendingMessagesImpl(bool report_externally);
+
   // Return pending location if any or unfilled structure.
   MessageLocation GetMessageLocation();
 
@@ -904,6 +923,7 @@ class Isolate {
   }
   StackGuard* stack_guard() { return &stack_guard_; }
   Heap* heap() { return &heap_; }
+  wasm::WasmEngine* wasm_engine() const { return wasm_engine_.get(); }
   StubCache* load_stub_cache() { return load_stub_cache_; }
   StubCache* store_stub_cache() { return store_stub_cache_; }
   DeoptimizerData* deoptimizer_data() { return deoptimizer_data_; }
@@ -988,12 +1008,6 @@ class Isolate {
   static size_t non_disposed_isolates() {
     return non_disposed_isolates_.Value();
   }
-
-  HistogramInfo* heap_histograms() { return heap_histograms_; }
-
-  JSObject::SpillInformation* js_spill_information() {
-    return &js_spill_information_;
-  }
 #endif
 
   Factory* factory() { return reinterpret_cast<Factory*>(this); }
@@ -1014,9 +1028,6 @@ class Isolate {
   }
 
   bool serializer_enabled() const { return serializer_enabled_; }
-  void set_serializer_enabled_for_test(bool serializer_enabled) {
-    serializer_enabled_ = serializer_enabled;
-  }
   bool snapshot_available() const {
     return snapshot_blob_ != nullptr && snapshot_blob_->raw_size != 0;
   }
@@ -1065,7 +1076,7 @@ class Isolate {
   // memory usage is expected.
   void SetFeedbackVectorsForProfilingTools(Object* value);
 
-  void InitializeVectorListFromHeap();
+  void MaybeInitializeVectorListFromHeap();
 
   double time_millis_since_init() {
     return heap_.MonotonicallyIncreasingTimeInMs() - time_millis_at_init_;
@@ -1086,7 +1097,13 @@ class Isolate {
   static const int kProtectorInvalid = 0;
 
   inline bool IsArrayConstructorIntact();
-  bool IsFastArrayConstructorPrototypeChainIntact();
+
+  // The version with an explicit context parameter can be used when
+  // Isolate::context is not set up, e.g. when calling directly into C++ from
+  // CSA.
+  bool IsNoElementsProtectorIntact(Context* context);
+  bool IsNoElementsProtectorIntact();
+
   inline bool IsArraySpeciesLookupChainIntact();
   bool IsIsConcatSpreadableLookupChainIntact();
   bool IsIsConcatSpreadableLookupChainIntact(JSReceiver* receiver);
@@ -1103,15 +1120,15 @@ class Isolate {
   // notifications occur if the set is on the elements of the array or
   // object prototype. Also ensure that changes to prototype chain between
   // Array and Object fire notifications.
-  void UpdateArrayProtectorOnSetElement(Handle<JSObject> object);
-  void UpdateArrayProtectorOnSetLength(Handle<JSObject> object) {
-    UpdateArrayProtectorOnSetElement(object);
+  void UpdateNoElementsProtectorOnSetElement(Handle<JSObject> object);
+  void UpdateNoElementsProtectorOnSetLength(Handle<JSObject> object) {
+    UpdateNoElementsProtectorOnSetElement(object);
   }
-  void UpdateArrayProtectorOnSetPrototype(Handle<JSObject> object) {
-    UpdateArrayProtectorOnSetElement(object);
+  void UpdateNoElementsProtectorOnSetPrototype(Handle<JSObject> object) {
+    UpdateNoElementsProtectorOnSetElement(object);
   }
-  void UpdateArrayProtectorOnNormalizeElements(Handle<JSObject> object) {
-    UpdateArrayProtectorOnSetElement(object);
+  void UpdateNoElementsProtectorOnNormalizeElements(Handle<JSObject> object) {
+    UpdateNoElementsProtectorOnSetElement(object);
   }
   void InvalidateArrayConstructorProtector();
   void InvalidateArraySpeciesProtector();
@@ -1125,8 +1142,6 @@ class Isolate {
 
   V8_EXPORT_PRIVATE CallInterfaceDescriptorData* call_descriptor_data(
       int index);
-
-  AccessCompilerData* access_compiler_data() { return access_compiler_data_; }
 
   void IterateDeferredHandles(RootVisitor* visitor);
   void LinkDeferredHandles(DeferredHandles* deferred_handles);
@@ -1161,7 +1176,13 @@ class Isolate {
 
   void* stress_deopt_count_address() { return &stress_deopt_count_; }
 
+  bool force_slow_path() { return force_slow_path_; }
+
+  bool* force_slow_path_address() { return &force_slow_path_; }
+
   V8_EXPORT_PRIVATE base::RandomNumberGenerator* random_number_generator();
+
+  V8_EXPORT_PRIVATE base::RandomNumberGenerator* fuzzer_rng();
 
   // Generates a random number that is non-zero when masked
   // with the provided mask.
@@ -1200,6 +1221,7 @@ class Isolate {
   void PromiseResolveThenableJob(Handle<PromiseResolveThenableJobInfo> info,
                                  MaybeHandle<Object>* result,
                                  MaybeHandle<Object>* maybe_exception);
+
   void EnqueueMicrotask(Handle<Object> microtask);
   void RunMicrotasks();
   bool IsRunningMicrotasks() const { return is_running_microtasks_; }
@@ -1221,6 +1243,14 @@ class Isolate {
 
   Address promise_hook_or_debug_is_active_address() {
     return reinterpret_cast<Address>(&promise_hook_or_debug_is_active_);
+  }
+
+  Address pending_microtask_count_address() {
+    return reinterpret_cast<Address>(&pending_microtask_count_);
+  }
+
+  Address handle_scope_implementer_address() {
+    return reinterpret_cast<Address>(&handle_scope_implementer_);
   }
 
   void DebugStateUpdated();
@@ -1247,10 +1277,6 @@ class Isolate {
 
   CancelableTaskManager* cancelable_task_manager() {
     return cancelable_task_manager_;
-  }
-
-  wasm::CompilationManager* wasm_compilation_manager() {
-    return wasm_compilation_manager_.get();
   }
 
   const AstStringConstants* ast_string_constants() const {
@@ -1293,9 +1319,6 @@ class Isolate {
 
 #ifdef USE_SIMULATOR
   base::Mutex* simulator_i_cache_mutex() { return &simulator_i_cache_mutex_; }
-  base::Mutex* simulator_redirection_mutex() {
-    return &simulator_redirection_mutex_;
-  }
 #endif
 
   void set_allow_atomics_wait(bool set) { allow_atomics_wait_ = set; }
@@ -1352,7 +1375,7 @@ class Isolate {
 
  protected:
   explicit Isolate(bool enable_serializer);
-  bool IsArrayOrObjectPrototype(Object* object);
+  bool IsArrayOrObjectOrStringPrototype(Object* object);
 
  private:
   friend struct GlobalState;
@@ -1515,8 +1538,8 @@ class Isolate {
   std::vector<int> regexp_indices_;
   DateCache* date_cache_;
   CallInterfaceDescriptorData* call_descriptor_data_;
-  AccessCompilerData* access_compiler_data_;
   base::RandomNumberGenerator* random_number_generator_;
+  base::RandomNumberGenerator* fuzzer_rng_;
   base::AtomicValue<RAILMode> rail_mode_;
   bool promise_hook_or_debug_is_active_;
   PromiseHook promise_hook_;
@@ -1548,8 +1571,6 @@ class Isolate {
 #ifdef DEBUG
   static base::AtomicNumber<size_t> non_disposed_isolates_;
 
-  // A static array of histogram info for each type.
-  HistogramInfo heap_histograms_[LAST_TYPE + 1];
   JSObject::SpillInformation js_spill_information_;
 #endif
 
@@ -1595,6 +1616,8 @@ class Isolate {
   // Counts deopt points if deopt_every_n_times is enabled.
   unsigned int stress_deopt_count_;
 
+  bool force_slow_path_;
+
   int next_optimization_id_;
 
 #if V8_SFI_HAS_UNIQUE_ID
@@ -1622,8 +1645,6 @@ class Isolate {
 
   CancelableTaskManager* cancelable_task_manager_;
 
-  std::unique_ptr<wasm::CompilationManager> wasm_compilation_manager_;
-
   debug::ConsoleDelegate* console_delegate_ = nullptr;
 
   v8::Isolate::AbortOnUncaughtExceptionCallback
@@ -1631,7 +1652,6 @@ class Isolate {
 
 #ifdef USE_SIMULATOR
   base::Mutex simulator_i_cache_mutex_;
-  base::Mutex simulator_redirection_mutex_;
 #endif
 
   bool allow_atomics_wait_;
@@ -1641,6 +1661,8 @@ class Isolate {
   size_t total_regexp_code_generated_;
 
   size_t elements_deletion_counter_ = 0;
+
+  std::unique_ptr<wasm::WasmEngine> wasm_engine_;
 
   // The top entry of the v8::Context::BackupIncumbentScope stack.
   const v8::Context::BackupIncumbentScope* top_backup_incumbent_scope_ =

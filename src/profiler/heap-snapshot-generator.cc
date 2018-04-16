@@ -1097,13 +1097,11 @@ void V8HeapExplorer::ExtractMapReferences(int entry, Map* map) {
                        Map::kDescriptorsOffset);
   SetInternalReference(map, entry, "prototype", map->prototype(),
                        Map::kPrototypeOffset);
-#if V8_DOUBLE_FIELDS_UNBOXING
   if (FLAG_unbox_double_fields) {
     SetInternalReference(map, entry, "layout_descriptor",
                          map->layout_descriptor(),
                          Map::kLayoutDescriptorOffset);
   }
-#endif
   Object* constructor_or_backpointer = map->constructor_or_backpointer();
   if (constructor_or_backpointer->IsMap()) {
     TagObject(constructor_or_backpointer, "(back pointer)");
@@ -1115,8 +1113,6 @@ void V8HeapExplorer::ExtractMapReferences(int entry, Map* map) {
                          constructor_or_backpointer,
                          Map::kConstructorOrBackPointerOffset);
   } else {
-    DCHECK(constructor_or_backpointer->IsJSFunction() ||
-           constructor_or_backpointer->IsNull(map->GetIsolate()));
     SetInternalReference(map, entry, "constructor", constructor_or_backpointer,
                          Map::kConstructorOrBackPointerOffset);
   }
@@ -1204,18 +1200,12 @@ void V8HeapExplorer::ExtractAccessorInfoReferences(
   SetInternalReference(accessor_info, entry, "expected_receiver_type",
                        accessor_info->expected_receiver_type(),
                        AccessorInfo::kExpectedReceiverTypeOffset);
-  if (accessor_info->IsAccessorInfo()) {
-    AccessorInfo* executable_accessor_info = AccessorInfo::cast(accessor_info);
-    SetInternalReference(executable_accessor_info, entry, "getter",
-                         executable_accessor_info->getter(),
-                         AccessorInfo::kGetterOffset);
-    SetInternalReference(executable_accessor_info, entry, "setter",
-                         executable_accessor_info->setter(),
-                         AccessorInfo::kSetterOffset);
-    SetInternalReference(executable_accessor_info, entry, "data",
-                         executable_accessor_info->data(),
-                         AccessorInfo::kDataOffset);
-  }
+  SetInternalReference(accessor_info, entry, "getter", accessor_info->getter(),
+                       AccessorInfo::kGetterOffset);
+  SetInternalReference(accessor_info, entry, "setter", accessor_info->setter(),
+                       AccessorInfo::kSetterOffset);
+  SetInternalReference(accessor_info, entry, "data", accessor_info->data(),
+                       AccessorInfo::kDataOffset);
 }
 
 void V8HeapExplorer::ExtractAccessorPairReferences(
@@ -1351,12 +1341,21 @@ void V8HeapExplorer::ExtractFixedArrayReferences(int entry, FixedArray* array) {
     return;
   }
   switch (it->second) {
-    case JS_WEAK_COLLECTION_SUB_TYPE:
-      for (int i = 0, l = array->length(); i < l; ++i) {
-        SetWeakReference(array, entry, i, array->get(i),
-                         array->OffsetOfElementAt(i));
+    case JS_WEAK_COLLECTION_SUB_TYPE: {
+      ObjectHashTable* table = ObjectHashTable::cast(array);
+      for (int i = 0, capacity = table->Capacity(); i < capacity; ++i) {
+        int key_index =
+            ObjectHashTable::EntryToIndex(i) + ObjectHashTable::kEntryKeyIndex;
+        int value_index = ObjectHashTable::EntryToValueIndex(i);
+        SetWeakReference(table, entry, key_index, table->get(key_index),
+                         table->OffsetOfElementAt(key_index));
+        SetInternalReference(table, entry, value_index, table->get(value_index),
+                             table->OffsetOfElementAt(value_index));
+        // TODO(alph): Add a strong link (shortcut?) from key to value per
+        //             WeakMap the key was added to. See crbug.com/778739
       }
       break;
+    }
 
     // TODO(alph): Add special processing for other types of FixedArrays.
 
@@ -1460,7 +1459,7 @@ void V8HeapExplorer::ExtractElementReferences(JSObject* js_obj, int entry) {
       }
     }
   } else if (js_obj->HasDictionaryElements()) {
-    SeededNumberDictionary* dictionary = js_obj->element_dictionary();
+    NumberDictionary* dictionary = js_obj->element_dictionary();
     int length = dictionary->Capacity();
     for (int i = 0; i < length; ++i) {
       Object* k = dictionary->KeyAt(i);
@@ -1658,7 +1657,8 @@ bool V8HeapExplorer::IsEssentialHiddenReference(Object* parent,
   if (parent->IsAllocationSite() &&
       field_offset == AllocationSite::kWeakNextOffset)
     return false;
-  if (parent->IsCode() && field_offset == Code::kNextCodeLinkOffset)
+  if (parent->IsCodeDataContainer() &&
+      field_offset == CodeDataContainer::kNextCodeLinkOffset)
     return false;
   if (parent->IsContext() &&
       field_offset == Context::OffsetOfElementAt(Context::NEXT_CONTEXT_LINK))
@@ -1905,6 +1905,9 @@ const char* V8HeapExplorer::GetStrongGcSubrootName(Object* object) {
 #define STRUCT_MAP_NAME(NAME, Name, name) NAME_ENTRY(name##_map)
     STRUCT_LIST(STRUCT_MAP_NAME)
 #undef STRUCT_MAP_NAME
+#define DATA_HANDLER_MAP_NAME(NAME, Name, Size, name) NAME_ENTRY(name##_map)
+    DATA_HANDLER_LIST(DATA_HANDLER_MAP_NAME)
+#undef DATA_HANDLER_MAP_NAME
 #define STRING_NAME(name, str) NAME_ENTRY(name)
     INTERNALIZED_STRING_LIST(STRING_NAME)
 #undef STRING_NAME
@@ -1915,6 +1918,10 @@ const char* V8HeapExplorer::GetStrongGcSubrootName(Object* object) {
     PUBLIC_SYMBOL_LIST(SYMBOL_NAME)
     WELL_KNOWN_SYMBOL_LIST(SYMBOL_NAME)
 #undef SYMBOL_NAME
+#define ACCESSOR_NAME(accessor_name, AccessorName) \
+  NAME_ENTRY(accessor_name##_accessor)
+    ACCESSOR_INFO_LIST(ACCESSOR_NAME)
+#undef ACCESSOR_NAME
 #undef NAME_ENTRY
     CHECK(!strong_gc_subroot_names_.is_empty());
   }
@@ -2728,10 +2735,10 @@ void HeapSnapshotJSONSerializer::SerializeSnapshot() {
 static void WriteUChar(OutputStreamWriter* w, unibrow::uchar u) {
   static const char hex_chars[] = "0123456789ABCDEF";
   w->AddString("\\u");
-  w->AddCharacter(hex_chars[(u >> 12) & 0xf]);
-  w->AddCharacter(hex_chars[(u >> 8) & 0xf]);
-  w->AddCharacter(hex_chars[(u >> 4) & 0xf]);
-  w->AddCharacter(hex_chars[u & 0xf]);
+  w->AddCharacter(hex_chars[(u >> 12) & 0xF]);
+  w->AddCharacter(hex_chars[(u >> 8) & 0xF]);
+  w->AddCharacter(hex_chars[(u >> 4) & 0xF]);
+  w->AddCharacter(hex_chars[u & 0xF]);
 }
 
 

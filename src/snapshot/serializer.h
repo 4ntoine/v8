@@ -194,6 +194,9 @@ class Serializer : public SerializerDeserializer {
       HeapObject* obj, HowToCode how_to_code, WhereToPoint where_to_point,
       int skip, BuiltinReferenceSerializationMode mode = kDefault);
 
+  // Returns true if the given heap object is a bytecode handler code object.
+  bool ObjectIsBytecodeHandler(HeapObject* obj) const;
+
   inline void FlushSkip(int skip) {
     if (skip != 0) {
       sink_.Put(kSkip, "SkipFromSerializeObject");
@@ -249,7 +252,7 @@ class Serializer : public SerializerDeserializer {
   AllocatorT allocator_;
 
 #ifdef OBJECT_PRINT
-  static const int kInstanceTypes = 256;
+  static const int kInstanceTypes = LAST_TYPE + 1;
   int* instance_type_count_;
   size_t* instance_type_size_;
 #endif  // OBJECT_PRINT
@@ -304,9 +307,8 @@ class Serializer<AllocatorT>::ObjectSerializer : public ObjectVisitor {
   void OutputCode(int size);
   int SkipTo(Address to);
   int32_t SerializeBackingStore(void* backing_store, int32_t byte_length);
-  void FixupIfNeutered();
+  void SerializeJSTypedArray();
   void SerializeJSArrayBuffer();
-  void SerializeFixedTypedArray();
   void SerializeExternalString();
   void SerializeExternalStringAsSequentialString();
 

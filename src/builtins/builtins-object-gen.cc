@@ -97,6 +97,22 @@ Node* ObjectBuiltinsAssembler::ConstructDataDescriptor(Node* context,
   return js_desc;
 }
 
+TF_BUILTIN(ObjectPrototypeToLocaleString, CodeStubAssembler) {
+  TNode<Context> context = CAST(Parameter(Descriptor::kContext));
+  TNode<Object> receiver = CAST(Parameter(Descriptor::kReceiver));
+
+  Label if_null_or_undefined(this, Label::kDeferred);
+  GotoIf(IsNullOrUndefined(receiver), &if_null_or_undefined);
+
+  TNode<Object> method =
+      CAST(GetProperty(context, receiver, factory()->toString_string()));
+  Return(CallJS(CodeFactory::Call(isolate()), context, method, receiver));
+
+  BIND(&if_null_or_undefined);
+  ThrowTypeError(context, MessageTemplate::kCalledOnNullOrUndefined,
+                 "Object.prototype.toLocaleString");
+}
+
 TF_BUILTIN(ObjectPrototypeHasOwnProperty, ObjectBuiltinsAssembler) {
   Node* object = Parameter(Descriptor::kReceiver);
   Node* key = Parameter(Descriptor::kKey);
@@ -157,10 +173,10 @@ TF_BUILTIN(ObjectPrototypeHasOwnProperty, ObjectBuiltinsAssembler) {
   Branch(IsName(key), &return_false, &call_runtime);
 
   BIND(&return_true);
-  Return(BooleanConstant(true));
+  Return(TrueConstant());
 
   BIND(&return_false);
-  Return(BooleanConstant(false));
+  Return(FalseConstant());
 
   BIND(&call_runtime);
   Return(CallRuntime(Runtime::kObjectHasOwnProperty, context, object, key));
@@ -303,7 +319,7 @@ TF_BUILTIN(ObjectPrototypeToString, ObjectBuiltinsAssembler) {
       if_error(this), if_function(this), if_number(this, Label::kDeferred),
       if_object(this), if_primitive(this), if_proxy(this, Label::kDeferred),
       if_regexp(this), if_string(this), if_symbol(this, Label::kDeferred),
-      if_value(this);
+      if_value(this), if_bigint(this, Label::kDeferred);
 
   Node* receiver = Parameter(Descriptor::kReceiver);
   Node* context = Parameter(Descriptor::kContext);
@@ -427,19 +443,19 @@ TF_BUILTIN(ObjectPrototypeToString, ObjectBuiltinsAssembler) {
 
   BIND(&if_primitive);
   {
-    Label return_null(this), return_undefined(this);
+    Label return_undefined(this);
 
     GotoIf(IsStringInstanceType(receiver_instance_type), &if_string);
+    GotoIf(IsBigIntInstanceType(receiver_instance_type), &if_bigint);
     GotoIf(IsBooleanMap(receiver_map), &if_boolean);
     GotoIf(IsHeapNumberMap(receiver_map), &if_number);
     GotoIf(IsSymbolMap(receiver_map), &if_symbol);
-    Branch(IsUndefined(receiver), &return_undefined, &return_null);
+    GotoIf(IsUndefined(receiver), &return_undefined);
+    CSA_ASSERT(this, IsNull(receiver));
+    Return(LoadRoot(Heap::knull_to_stringRootIndex));
 
     BIND(&return_undefined);
     Return(LoadRoot(Heap::kundefined_to_stringRootIndex));
-
-    BIND(&return_null);
-    Return(LoadRoot(Heap::knull_to_stringRootIndex));
   }
 
   BIND(&if_proxy);
@@ -507,6 +523,20 @@ TF_BUILTIN(ObjectPrototypeToString, ObjectBuiltinsAssembler) {
     Goto(&checkstringtag);
   }
 
+  BIND(&if_bigint);
+  {
+    Node* native_context = LoadNativeContext(context);
+    Node* bigint_constructor =
+        LoadContextElement(native_context, Context::BIGINT_FUNCTION_INDEX);
+    Node* bigint_initial_map = LoadObjectField(
+        bigint_constructor, JSFunction::kPrototypeOrInitialMapOffset);
+    Node* bigint_prototype =
+        LoadObjectField(bigint_initial_map, Map::kPrototypeOffset);
+    var_default.Bind(LoadRoot(Heap::kobject_to_stringRootIndex));
+    var_holder.Bind(bigint_prototype);
+    Goto(&checkstringtag);
+  }
+
   BIND(&if_value);
   {
     Node* receiver_value = LoadJSValueValue(receiver);
@@ -514,7 +544,12 @@ TF_BUILTIN(ObjectPrototypeToString, ObjectBuiltinsAssembler) {
     Node* receiver_value_map = LoadMap(receiver_value);
     GotoIf(IsHeapNumberMap(receiver_value_map), &if_number);
     GotoIf(IsBooleanMap(receiver_value_map), &if_boolean);
-    Branch(IsSymbolMap(receiver_value_map), &if_symbol, &if_string);
+    GotoIf(IsSymbolMap(receiver_value_map), &if_symbol);
+    Node* receiver_value_instance_type =
+        LoadMapInstanceType(receiver_value_map);
+    GotoIf(IsBigIntInstanceType(receiver_value_instance_type), &if_bigint);
+    CSA_ASSERT(this, IsStringInstanceType(receiver_value_instance_type));
+    Goto(&if_string);
   }
 
   BIND(&checkstringtag);
@@ -531,7 +566,7 @@ TF_BUILTIN(ObjectPrototypeToString, ObjectBuiltinsAssembler) {
       GotoIf(IsNull(holder), &return_default);
       Node* holder_map = LoadMap(holder);
       Node* holder_bit_field3 = LoadMapBitField3(holder_map);
-      GotoIf(IsSetWord32<Map::MayHaveInterestingSymbols>(holder_bit_field3),
+      GotoIf(IsSetWord32<Map::MayHaveInterestingSymbolsBit>(holder_bit_field3),
              &return_generic);
       var_holder.Bind(LoadMapPrototype(holder_map));
       Goto(&loop);
@@ -577,7 +612,7 @@ TF_BUILTIN(ObjectCreate, ObjectBuiltinsAssembler) {
       no_properties(this);
   {
     Comment("Argument 1 check: prototype");
-    GotoIf(WordEqual(prototype, NullConstant()), &prototype_valid);
+    GotoIf(IsNull(prototype), &prototype_valid);
     BranchIfJSReceiver(prototype, &prototype_valid, &call_runtime);
   }
 
@@ -587,7 +622,7 @@ TF_BUILTIN(ObjectCreate, ObjectBuiltinsAssembler) {
     // Check that we have a simple object
     GotoIf(TaggedIsSmi(properties), &call_runtime);
     // Undefined implies no properties.
-    GotoIf(WordEqual(properties, UndefinedConstant()), &no_properties);
+    GotoIf(IsUndefined(properties), &no_properties);
     Node* properties_map = LoadMap(properties);
     GotoIf(IsSpecialReceiverMap(properties_map), &call_runtime);
     // Stay on the fast path only if there are no elements.
@@ -596,7 +631,7 @@ TF_BUILTIN(ObjectCreate, ObjectBuiltinsAssembler) {
               &call_runtime);
     // Handle dictionary objects or fast objects with properties in runtime.
     Node* bit_field3 = LoadMapBitField3(properties_map);
-    GotoIf(IsSetWord32<Map::DictionaryMap>(bit_field3), &call_runtime);
+    GotoIf(IsSetWord32<Map::IsDictionaryMapBit>(bit_field3), &call_runtime);
     Branch(IsSetWord32<Map::NumberOfOwnDescriptorsBits>(bit_field3),
            &call_runtime, &no_properties);
   }
@@ -608,7 +643,7 @@ TF_BUILTIN(ObjectCreate, ObjectBuiltinsAssembler) {
     VARIABLE(properties, MachineRepresentation::kTagged);
     Label non_null_proto(this), instantiate_map(this), good(this);
 
-    Branch(WordEqual(prototype, NullConstant()), &good, &non_null_proto);
+    Branch(IsNull(prototype), &good, &non_null_proto);
 
     BIND(&good);
     {
@@ -634,7 +669,7 @@ TF_BUILTIN(ObjectCreate, ObjectBuiltinsAssembler) {
       Comment("Load ObjectCreateMap from PrototypeInfo");
       Node* weak_cell =
           LoadObjectField(prototype_info, PrototypeInfo::kObjectCreateMap);
-      GotoIf(WordEqual(weak_cell, UndefinedConstant()), &call_runtime);
+      GotoIf(IsUndefined(weak_cell), &call_runtime);
       map.Bind(LoadWeakCellValue(weak_cell, &call_runtime));
       Goto(&instantiate_map);
     }
@@ -741,9 +776,9 @@ TF_BUILTIN(CreateGeneratorObject, ObjectBuiltinsAssembler) {
   Node* register_file = AllocateFixedArray(HOLEY_ELEMENTS, size);
   FillFixedArrayWithValue(HOLEY_ELEMENTS, register_file, IntPtrConstant(0),
                           size, Heap::kUndefinedValueRootIndex);
-
-  Node* const result = AllocateJSObjectFromMap(maybe_map);
-
+  // TODO(cbruni): support start_offset to avoid double initialization.
+  Node* result = AllocateJSObjectFromMap(maybe_map, nullptr, nullptr, kNone,
+                                         kWithSlackTracking);
   StoreObjectFieldNoWriteBarrier(result, JSGeneratorObject::kFunctionOffset,
                                  closure);
   StoreObjectFieldNoWriteBarrier(result, JSGeneratorObject::kContextOffset,
@@ -755,7 +790,6 @@ TF_BUILTIN(CreateGeneratorObject, ObjectBuiltinsAssembler) {
   Node* executing = SmiConstant(JSGeneratorObject::kGeneratorExecuting);
   StoreObjectFieldNoWriteBarrier(result, JSGeneratorObject::kContinuationOffset,
                                  executing);
-  HandleSlackTracking(context, result, maybe_map, JSGeneratorObject::kSize);
   Return(result);
 
   BIND(&runtime);
@@ -769,8 +803,7 @@ TF_BUILTIN(CreateGeneratorObject, ObjectBuiltinsAssembler) {
 TF_BUILTIN(ObjectGetOwnPropertyDescriptor, ObjectBuiltinsAssembler) {
   Node* argc = Parameter(BuiltinDescriptor::kArgumentsCount);
   Node* context = Parameter(BuiltinDescriptor::kContext);
-  CSA_ASSERT(this, WordEqual(Parameter(BuiltinDescriptor::kNewTarget),
-                             UndefinedConstant()));
+  CSA_ASSERT(this, IsUndefined(Parameter(BuiltinDescriptor::kNewTarget)));
 
   CodeStubArguments args(this, ChangeInt32ToIntPtr(argc));
   Node* object = args.GetOptionalArgumentValue(0);

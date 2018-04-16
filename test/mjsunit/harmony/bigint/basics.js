@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --allow-natives-syntax --harmony-bigint --no-opt
+// Flags: --allow-natives-syntax --harmony-bigint
 
 'use strict'
 
@@ -18,6 +18,80 @@ const six = BigInt(6);
 // BigInt
 {
   assertSame(BigInt, BigInt.prototype.constructor)
+}{
+  assertThrows(() => new BigInt, TypeError);
+  assertThrows(() => new BigInt(), TypeError);
+  assertThrows(() => new BigInt(0), TypeError);
+  assertThrows(() => new BigInt(0n), TypeError);
+  assertThrows(() => new BigInt("0"), TypeError);
+}{
+  class C extends BigInt { constructor() { throw 42 } };
+  assertThrowsEquals(() => new C, 42);
+}
+
+// ToBigInt, NumberToBigInt, BigInt
+{
+  assertThrows(() => BigInt(undefined), TypeError);
+  assertThrows(() => BigInt(null), TypeError);
+  assertThrows(() => BigInt({}), SyntaxError);
+  assertThrows(() => BigInt("foo"), SyntaxError);
+
+  assertThrows(() => BigInt("1j"), SyntaxError);
+  assertThrows(() => BigInt("0b1ju"), SyntaxError);
+  assertThrows(() => BigInt("0o1jun"), SyntaxError);
+  assertThrows(() => BigInt("0x1junk"), SyntaxError);
+}{
+  assertSame(BigInt(true), 1n);
+  assertSame(BigInt(false), 0n);
+  assertSame(BigInt(""), 0n);
+  assertSame(BigInt(" 42"), 42n);
+  assertSame(BigInt("0b101010"), 42n);
+  assertSame(BigInt("  0b101011"), 43n);
+  assertSame(BigInt("0x2a  "), 42n);
+  assertSame(BigInt("    0x2b"), 43n);
+  assertSame(BigInt("0o52"), 42n);
+  assertSame(BigInt("     0o53\n"), 43n);
+  assertSame(BigInt(-0), 0n);
+  assertSame(BigInt(42), 42n);
+  assertSame(BigInt(42n), 42n);
+  assertSame(BigInt(Object(42n)), 42n);
+  assertSame(BigInt(2**53 - 1), 9007199254740991n);
+  assertSame(BigInt(Object(2**53 - 1)), 9007199254740991n);
+  assertSame(BigInt([]), 0n);
+}{
+  assertThrows(() => BigInt(NaN), RangeError);
+  assertThrows(() => BigInt(-Infinity), RangeError);
+  assertThrows(() => BigInt(+Infinity), RangeError);
+  assertThrows(() => BigInt(4.00000001), RangeError);
+  assertThrows(() => BigInt(Object(4.00000001)), RangeError);
+  assertThrows(() => BigInt(2**53), RangeError);
+  assertThrows(() => BigInt(2**1000), RangeError);
+}
+
+// BigInt.prototype[Symbol.toStringTag]
+{
+  const toStringTag = Object.getOwnPropertyDescriptor(
+      BigInt.prototype, Symbol.toStringTag);
+  assertTrue(toStringTag.configurable);
+  assertFalse(toStringTag.enumerable);
+  assertFalse(toStringTag.writable);
+  assertEquals("BigInt", toStringTag.value);
+}
+
+// Object.prototype.toString
+{
+  const toString = Object.prototype.toString;
+
+  assertEquals("[object BigInt]", toString.call(42n));
+  assertEquals("[object BigInt]", toString.call(Object(42n)));
+
+  delete BigInt.prototype[Symbol.toStringTag];
+  assertEquals("[object Object]", toString.call(42n));
+  assertEquals("[object Object]", toString.call(Object(42n)));
+
+  BigInt.prototype[Symbol.toStringTag] = "foo";
+  assertEquals("[object foo]", toString.call(42n));
+  assertEquals("[object foo]", toString.call(Object(42n)));
 }
 
 // typeof
@@ -28,13 +102,9 @@ const six = BigInt(6);
   assertEquals(%Typeof(zero), "bigint");
   assertEquals(%Typeof(one), "bigint");
 }{
-  // TODO(neis): Enable once --no-opt can be removed.
-  //
-  // function Typeof(x) { return typeof x }
-  // assertEquals(Typeof(zero), "bigint");
-  // assertEquals(Typeof(zero), "bigint");
-  // %OptimizeFunctionOnNextCall(Typeof);
-  // assertEquals(Typeof(zero), "bigint");
+  assertTrue(typeof 1n === "bigint");
+  assertFalse(typeof 1n === "BigInt");
+  assertFalse(typeof 1 === "bigint");
 }
 
 // ToString
@@ -230,8 +300,7 @@ const six = BigInt(6);
   assertEquals(Object(zero).valueOf(), another_zero);
   assertThrows(() => { return BigInt.prototype.valueOf.call("string"); },
                TypeError);
-  // TODO(jkummerow): Add tests for (new BigInt(...)).valueOf() when we
-  // can construct BigInt wrappers.
+  assertEquals(-42n, Object(-42n).valueOf());
 }
 
 // ToBoolean

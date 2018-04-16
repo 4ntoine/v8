@@ -34,18 +34,17 @@ void StartupDeserializer::DeserializeInto(Isolate* isolate) {
 
   {
     DisallowHeapAllocation no_gc;
-
-    isolate->heap()->IterateStrongRoots(this, VISIT_ONLY_STRONG_ROOT_LIST);
     isolate->heap()->IterateSmiRoots(this);
     isolate->heap()->IterateStrongRoots(this, VISIT_ONLY_STRONG);
     isolate->heap()->RepairFreeListsAfterDeserialization();
-    isolate->heap()->IterateWeakRoots(this, VISIT_ALL);
+    isolate->heap()->IterateWeakRoots(this, VISIT_FOR_SERIALIZATION);
     DeserializeDeferredObjects();
     RestoreExternalReferenceRedirectors(accessor_infos());
+    RestoreExternalReferenceRedirectors(call_handler_infos());
 
     // Deserialize eager builtins from the builtin snapshot. Note that deferred
     // objects must have been deserialized prior to this.
-    builtin_deserializer.DeserializeEagerBuiltins();
+    builtin_deserializer.DeserializeEagerBuiltinsAndHandlers();
 
     // Flush the instruction cache for the entire code-space. Must happen after
     // builtins deserialization.
@@ -72,7 +71,7 @@ void StartupDeserializer::DeserializeInto(Isolate* isolate) {
   // to display the builtin names.
   PrintDisassembledCodeObjects();
 
-  if (FLAG_rehash_snapshot && can_rehash()) Rehash();
+  if (FLAG_rehash_snapshot && can_rehash()) RehashHeap();
 }
 
 void StartupDeserializer::FlushICacheForNewIsolate() {
@@ -104,12 +103,10 @@ void StartupDeserializer::PrintDisassembledCodeObjects() {
 #endif
 }
 
-void StartupDeserializer::Rehash() {
+void StartupDeserializer::RehashHeap() {
   DCHECK(FLAG_rehash_snapshot && can_rehash());
   isolate()->heap()->InitializeHashSeed();
-  isolate()->heap()->string_table()->Rehash();
-  isolate()->heap()->weak_object_to_code_table()->Rehash();
-  SortMapDescriptors();
+  Rehash();
 }
 
 }  // namespace internal
